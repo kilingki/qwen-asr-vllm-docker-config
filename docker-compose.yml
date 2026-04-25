@@ -1,0 +1,51 @@
+services:
+  asr-api:
+    build:
+      context: ./asr-api
+      dockerfile: Dockerfile
+    container_name: asr-api
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "0"
+      CUDA_VISIBLE_DEVICES: "0"
+      HF_HOME: /models/.cache
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      ASR_BASE_URL: ${ASR_BASE_URL:-http://127.0.0.1:18000/v1}
+      QWEN_ASR_INTERNAL_HOST: ${QWEN_ASR_INTERNAL_HOST:-127.0.0.1}
+      QWEN_ASR_INTERNAL_PORT: ${QWEN_ASR_INTERNAL_PORT:-18000}
+      ASR_MODEL_PATH: ${ASR_MODEL_PATH:-/models/Qwen3-ASR-1.7B}
+      ASR_MODEL: ${ASR_MODEL:-qwen3-asr}
+      ASR_GPU_MEMORY_UTILIZATION: ${ASR_GPU_MEMORY_UTILIZATION:-0.72}
+      ASR_MAX_MODEL_LEN: ${ASR_MAX_MODEL_LEN:-10000}
+      ASR_GENERATION_CONFIG: ${ASR_GENERATION_CONFIG:-vllm}
+      DEFAULT_LANGUAGE: ${DEFAULT_LANGUAGE:-ko}
+      CHUNK_SECONDS: ${CHUNK_SECONDS:-120}
+      CHUNK_OVERLAP_SECONDS: ${CHUNK_OVERLAP_SECONDS:-2}
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-600}
+      STORAGE_DIR: /data
+    volumes:
+      - ./data:/data
+      - ${MODEL_HOST_DIR:-../models/stt/hf}:/models
+    ports:
+      - "${ASR_API_PORT:-8080}:8080"
+    shm_size: "4gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import json, urllib.request; r = json.loads(urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).read()); assert r.get('backend_reachable') is True"
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    restart: "no"
