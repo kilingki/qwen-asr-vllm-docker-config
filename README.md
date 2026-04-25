@@ -97,8 +97,7 @@ Basic transcription:
 ```bash
 curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
   -F "file=@sample.wav" \
-  -F "model=qwen3-asr" \
-  -F "language=ko"
+  -F "model=qwen3-asr"
 ```
 
 Verbose response with segment timestamps:
@@ -107,7 +106,6 @@ Verbose response with segment timestamps:
 curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
   -F "file=@sample.wav" \
   -F "model=qwen3-asr" \
-  -F "language=ko" \
   -F "response_format=verbose_json" \
   -F "timestamp_granularities[]=segment"
 ```
@@ -118,7 +116,6 @@ Verbose response with word timestamps:
 curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
   -F "file=@sample.wav" \
   -F "model=qwen3-asr" \
-  -F "language=ko" \
   -F "response_format=verbose_json" \
   -F "timestamp_granularities[]=segment" \
   -F "timestamp_granularities[]=word"
@@ -146,6 +143,7 @@ The main settings are documented in `.env.example`.
 - `ASR_MODEL_PATH`: container path to `Qwen3-ASR-1.7B`
 - `ASR_BASE_URL`: internal base URL used by the facade
 - `ASR_MODEL`: served model name exposed by the Qwen server
+- `DEFAULT_LANGUAGE`: default transcription language used by the API and test script
 - `CHUNK_SECONDS`: chunk size for long audio
 - `CHUNK_OVERLAP_SECONDS`: overlap between adjacent chunks
 
@@ -161,7 +159,6 @@ Set the YouTube URL directly at the top of `scripts/test_qwen_asr_youtube.py`, a
 
 - `STT_BASE_URL`
 - `STT_MODEL`
-- `STT_LANGUAGE`
 - `STT_RESPONSE_FORMAT`
 - `STT_TIMESTAMP_GRANULARITIES`
 - `STT_OUTPUT_DIR`

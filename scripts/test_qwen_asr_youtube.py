@@ -68,7 +68,7 @@ YOUTUBE_URL = "https://www.youtube.com/watch?v=ZYbKUUrbatI"
 
 BASE_URL = read_env("STT_BASE_URL", "http://localhost:8080").rstrip("/")
 MODEL = read_env("STT_MODEL", "qwen3-asr")
-LANGUAGE = read_env("STT_LANGUAGE", "ko")
+LANGUAGE = read_env("DEFAULT_LANGUAGE", "ko")
 RESPONSE_FORMAT = read_env("STT_RESPONSE_FORMAT", "verbose_json")
 TIMESTAMP_GRANULARITIES = parse_timestamp_granularities(
     read_env("STT_TIMESTAMP_GRANULARITIES", "segment,word")
