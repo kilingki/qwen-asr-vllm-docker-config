@@ -50,9 +50,11 @@ NO_SPACE_BEFORE_HANGUL_TOKENS = {
     "한",
 }
 ASR_ARTIFACT_REPLACEMENTS = (
-    re.compile(r"language\s*(?:Korean\s*asr\s*text|Koreanasrtext)", re.IGNORECASE),
-    re.compile(r"Korean\s*asr\s*text", re.IGNORECASE),
-    re.compile(r"Koreanasrtext", re.IGNORECASE),
+    re.compile(
+        r"(?:language\s*)?Korean\s*<?\s*asr[\s_-]*text\s*>?",
+        re.IGNORECASE,
+    ),
+    re.compile(r"language\s*Koreanasrtext", re.IGNORECASE),
 )
 STANDALONE_LANGUAGE_ARTIFACT = re.compile(
     r"(?:(?<=^)|(?<=[\s\]\)])|(?<=[\uac00-\ud7af0-9]))language(?=$|[\s\uac00-\ud7af0-9])",
@@ -263,8 +265,8 @@ def _clean_words(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _clean_asr_text(text: str) -> str:
     cleaned = text
     for pattern in ASR_ARTIFACT_REPLACEMENTS:
-        cleaned = pattern.sub("", cleaned)
-    cleaned = STANDALONE_LANGUAGE_ARTIFACT.sub("", cleaned)
+        cleaned = pattern.sub(" ", cleaned)
+    cleaned = STANDALONE_LANGUAGE_ARTIFACT.sub(" ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned)
     cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
     return cleaned.strip()
