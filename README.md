@@ -166,7 +166,15 @@ Set the YouTube URL directly at the top of `scripts/test_qwen_asr_youtube.py`, a
 - `STT_TIMESTAMP_GRANULARITIES`
 - `STT_OUTPUT_DIR`
 
-By default the script requests `verbose_json` with segment timestamps. Generated outputs are saved to `scripts/outputs/` by default, and that directory is excluded from git tracking.
+By default the script requests `verbose_json` with segment timestamps, and can also request word timestamps through `STT_TIMESTAMP_GRANULARITIES`. Generated outputs are saved to `scripts/outputs/` by default, and that directory is excluded from git tracking.
+
+Generated output files:
+
+- `<audio>.verbose_json.json`: full JSON response from the facade API, including `text`, `language`, `duration`, and timestamped `segments`.
+- `<audio>.segments.txt`: one line per segment, formatted as `[start - end] text` for quick timestamp review.
+- `<audio>.words.txt`: one line per word timestamp when `word` granularity is requested.
+- `<audio>.clean.txt`: cleaned transcript text without timestamps, intended for reading or downstream text processing.
+- `<audio>.txt`, `<audio>.srt`, or `<audio>.vtt`: plain text or subtitle output when `STT_RESPONSE_FORMAT` is set to `text`, `srt`, or `vtt`.
 
 ## Notes
 
