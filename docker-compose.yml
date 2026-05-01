@@ -21,6 +21,7 @@ services:
       DEFAULT_LANGUAGE: ${DEFAULT_LANGUAGE:-ko}
       CHUNK_SECONDS: ${CHUNK_SECONDS:-120}
       CHUNK_OVERLAP_SECONDS: ${CHUNK_OVERLAP_SECONDS:-2}
+      MAX_CONCURRENT_CHUNKS: ${MAX_CONCURRENT_CHUNKS:-2}
       REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-600}
       STORAGE_DIR: /data
     volumes:
@@ -44,7 +45,7 @@ services:
           "-c",
           "import json, urllib.request; r = json.loads(urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).read()); assert r.get('backend_reachable') is True"
         ]
-      interval: 30s
+      interval: 60s
       timeout: 5s
       retries: 5
       start_period: 60s

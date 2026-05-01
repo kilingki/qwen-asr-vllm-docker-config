@@ -1,3 +1,4 @@
+import asyncio
 import re
 from pathlib import Path
 from typing import Any
@@ -7,6 +8,7 @@ from .audio import AudioChunk, create_chunks, probe_duration
 from .config import (
     CHUNK_OVERLAP_SECONDS,
     CHUNK_SECONDS,
+    MAX_CONCURRENT_CHUNKS,
 )
 
 
@@ -86,17 +88,15 @@ class TranscriptionPipeline:
         merged_text = ""
         merged_segments: list[dict[str, Any]] = []
 
-        for chunk in chunks:
-            raw_result = await self.asr_client.transcribe(
-                audio_path=chunk.path,
-                model=model,
-                language=language,
-                prompt=prompt,
-                timestamp_granularities=timestamp_granularities,
-            )
-            normalized = self._normalize_backend_result(raw_result, chunk)
-            normalized = _clean_normalized_result(normalized)
+        normalized_results = await self._transcribe_chunks(
+            chunks=chunks,
+            model=model,
+            language=language,
+            prompt=prompt,
+            timestamp_granularities=timestamp_granularities,
+        )
 
+        for chunk, normalized in zip(chunks, normalized_results, strict=True):
             if not merged_language:
                 merged_language = normalized.get("language") or language
 
@@ -123,6 +123,30 @@ class TranscriptionPipeline:
             "duration": duration,
             "segments": _reindex_segments(merged_segments),
         }
+
+    async def _transcribe_chunks(
+        self,
+        chunks: list[AudioChunk],
+        model: str,
+        language: str | None,
+        prompt: str | None,
+        timestamp_granularities: list[str],
+    ) -> list[dict[str, Any]]:
+        semaphore = asyncio.Semaphore(max(1, MAX_CONCURRENT_CHUNKS))
+
+        async def transcribe_one(chunk: AudioChunk) -> dict[str, Any]:
+            async with semaphore:
+                raw_result = await self.asr_client.transcribe(
+                    audio_path=chunk.path,
+                    model=model,
+                    language=language,
+                    prompt=prompt,
+                    timestamp_granularities=timestamp_granularities,
+                )
+            normalized = self._normalize_backend_result(raw_result, chunk)
+            return _clean_normalized_result(normalized)
+
+        return await asyncio.gather(*(transcribe_one(chunk) for chunk in chunks))
 
     def _normalize_backend_result(
         self,

@@ -128,7 +128,7 @@ The facade API performs the following steps:
 1. store the uploaded audio to a temporary workspace
 2. convert it into `16kHz mono wav` via `ffmpeg`
 3. split long audio into overlapping chunks
-4. call the internal Qwen server for each chunk
+4. call the internal Qwen server for chunks, with bounded concurrency
 5. merge text and segment offsets back into a single timeline
 6. return an OpenAI-style response
 
@@ -146,6 +146,11 @@ The main settings are documented in `.env.example`.
 - `DEFAULT_LANGUAGE`: default transcription language used by the API and test script
 - `CHUNK_SECONDS`: chunk size for long audio
 - `CHUNK_OVERLAP_SECONDS`: overlap between adjacent chunks
+- `MAX_CONCURRENT_CHUNKS`: maximum number of audio chunks transcribed at the same time
+
+For throughput tuning, start with `MAX_CONCURRENT_CHUNKS=2`. If vLLM logs still show
+low GPU memory use and only one running request, increase it gradually. If latency
+or memory pressure gets worse, reduce it back to `1`.
 
 ## Test Script
 
