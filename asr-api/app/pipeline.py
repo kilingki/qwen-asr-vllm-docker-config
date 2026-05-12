@@ -58,10 +58,16 @@ ASR_ARTIFACT_REPLACEMENTS = (
     ),
     re.compile(r"language\s*Koreanasrtext", re.IGNORECASE),
 )
+ASR_TRANSCRIPT_MARKER = re.compile(
+    r"\blanguage\s+(?P<language>[A-Za-z][A-Za-z_-]*)\s*<\s*asr[\s_-]*text\s*>",
+    re.IGNORECASE,
+)
 STANDALONE_LANGUAGE_ARTIFACT = re.compile(
     r"(?:(?<=^)|(?<=[\s\]\)])|(?<=[\uac00-\ud7af0-9]))language(?=$|[\s\uac00-\ud7af0-9])",
     re.IGNORECASE,
 )
+REPEATED_NO_TAIL = re.compile(r"(?:[\s,.;:!?]*(?:no)\b){20,}\s*$", re.IGNORECASE)
+TEXT_TOKEN_RE = re.compile(r"[\uac00-\ud7afA-Za-z0-9]+")
 
 
 class TranscriptionPipeline:
@@ -268,6 +274,9 @@ def _clean_normalized_result(result: dict[str, Any]) -> dict[str, Any]:
         item["text"] = _clean_asr_text(str(item.get("text", "")))
         raw_words = item.get("words", [])
         item["words"] = _clean_words(raw_words if isinstance(raw_words, list) else [])
+        quality_text = item["text"] or " ".join(str(word.get("word", "")) for word in item["words"])
+        if _is_asr_garbage_text(quality_text):
+            continue
         if item["text"] or item["words"]:
             cleaned_segments.append(item)
     cleaned["segments"] = cleaned_segments
@@ -287,13 +296,70 @@ def _clean_words(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _clean_asr_text(text: str) -> str:
-    cleaned = text
+    cleaned = _clean_transcript_marker(text)
     for pattern in ASR_ARTIFACT_REPLACEMENTS:
         cleaned = pattern.sub(" ", cleaned)
     cleaned = STANDALONE_LANGUAGE_ARTIFACT.sub(" ", cleaned)
+    cleaned = REPEATED_NO_TAIL.sub("", cleaned)
+    cleaned = _strip_repetitive_non_korean_tail(cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned)
     cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
     return cleaned.strip()
+
+
+def _clean_transcript_marker(text: str) -> str:
+    marker = ASR_TRANSCRIPT_MARKER.search(text)
+    if not marker:
+        return text
+
+    prefix = text[: marker.start()].strip()
+    suffix = text[marker.end() :].strip()
+    language = marker.group("language").lower()
+    is_korean_marker = language in {"ko", "kor", "korean"}
+
+    if prefix and suffix and is_korean_marker:
+        return f"{prefix} {suffix}"
+    if prefix and not is_korean_marker:
+        return prefix
+    return suffix
+
+
+def _strip_repetitive_non_korean_tail(text: str) -> str:
+    token_matches = list(TEXT_TOKEN_RE.finditer(text))
+    if len(token_matches) < 24:
+        return text
+
+    max_tail_tokens = min(240, len(token_matches))
+    for tail_size in range(max_tail_tokens, 23, -1):
+        tail_matches = token_matches[-tail_size:]
+        tail_text = text[tail_matches[0].start() :]
+        if _is_asr_garbage_text(tail_text):
+            return text[: tail_matches[0].start()].rstrip(" ,.;:!?")
+
+    return text
+
+
+def _is_asr_garbage_text(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return False
+
+    tokens = [match.group(0).lower() for match in TEXT_TOKEN_RE.finditer(normalized)]
+    if len(tokens) < 20:
+        return False
+
+    hangul_chars = len(HANGUL_RE.findall(normalized))
+    text_chars = sum(1 for char in normalized if char.isalnum())
+    hangul_ratio = hangul_chars / text_chars if text_chars else 0.0
+    unique_ratio = len(set(tokens)) / len(tokens)
+
+    if hangul_ratio >= 0.05:
+        return False
+    if unique_ratio <= 0.15:
+        return True
+
+    most_common_count = max(tokens.count(token) for token in set(tokens))
+    return most_common_count >= 20 and most_common_count / len(tokens) >= 0.7
 
 
 def _offset_and_clip_segments(

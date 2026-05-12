@@ -80,6 +80,7 @@ OUTPUT_DIR = Path(
     read_env("STT_OUTPUT_DIR", str(project_root() / "scripts" / "outputs"))
 )
 ASR_ARTIFACT_REPLACEMENTS = (
+    re.compile(r"\blanguage\s+[A-Za-z][A-Za-z_-]*\s*<\s*asr[\s_-]*text\s*>", re.IGNORECASE),
     re.compile(r"language\s*(?:Korean\s*asr\s*text|Koreanasrtext)", re.IGNORECASE),
     re.compile(r"Korean\s*asr\s*text", re.IGNORECASE),
     re.compile(r"Koreanasrtext", re.IGNORECASE),
