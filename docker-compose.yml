@@ -23,7 +23,11 @@ services:
       CHUNK_OVERLAP_SECONDS: ${CHUNK_OVERLAP_SECONDS:-2}
       MAX_CONCURRENT_CHUNKS: ${MAX_CONCURRENT_CHUNKS:-2}
       REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-600}
+      FA_BASE_URL: ${FA_BASE_URL:-}
+      FA_MAX_AUDIO_SECONDS: ${FA_MAX_AUDIO_SECONDS:-180}
       STORAGE_DIR: /data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./data:/data
       - ${MODEL_HOST_DIR:-../models/stt/hf}:/models

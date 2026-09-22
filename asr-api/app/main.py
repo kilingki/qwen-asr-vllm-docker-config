@@ -11,11 +11,13 @@ from .config import (
     ASR_BASE_URL,
     ASR_MODEL,
     DEFAULT_LANGUAGE,
+    FA_BASE_URL,
     REQUEST_TIMEOUT_SECONDS,
     SUPPORTED_RESPONSE_FORMATS,
     SUPPORTED_TIMESTAMP_GRANULARITIES,
     TMP_DIR,
 )
+from .fa_client import ForcedAlignerClient
 from .formatter import (
     to_json_response,
     to_srt,
@@ -31,24 +33,33 @@ app = FastAPI(
 )
 
 asr_client: QwenAsrClient | None = None
+fa_client: ForcedAlignerClient | None = None
 pipeline: TranscriptionPipeline | None = None
 
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    global asr_client, pipeline
+    global asr_client, fa_client, pipeline
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     asr_client = QwenAsrClient(
         base_url=ASR_BASE_URL,
         timeout_seconds=REQUEST_TIMEOUT_SECONDS,
     )
-    pipeline = TranscriptionPipeline(asr_client=asr_client)
+    fa_client = None
+    if FA_BASE_URL:
+        fa_client = ForcedAlignerClient(
+            base_url=FA_BASE_URL,
+            timeout_seconds=REQUEST_TIMEOUT_SECONDS,
+        )
+    pipeline = TranscriptionPipeline(asr_client=asr_client, fa_client=fa_client)
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
     if asr_client is not None:
         await asr_client.close()
+    if fa_client is not None:
+        await fa_client.close()
 
 
 @app.get("/health")
@@ -61,9 +72,16 @@ async def health() -> dict[str, Any]:
     except Exception:
         backend_reachable = False
 
+    fa_configured = bool(FA_BASE_URL)
+    fa_reachable = False
+    if fa_configured and fa_client is not None:
+        fa_reachable = await fa_client.reachable()
+
     return {
         "status": "ok",
         "backend_reachable": backend_reachable,
+        "fa_configured": fa_configured,
+        "fa_reachable": fa_reachable,
     }
 
 
@@ -109,6 +127,12 @@ async def create_transcription(
                 "Unsupported timestamp_granularities: "
                 + ", ".join(unsupported_granularities)
             ),
+        )
+
+    if "word" in timestamp_granularities and fa_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Forced aligner is not configured",
         )
 
     assert pipeline is not None

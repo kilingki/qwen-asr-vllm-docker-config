@@ -15,6 +15,8 @@ The runtime uses one Docker Compose service:
 [asr-api :8080]
    |
    +--> [qwen-asr-serve 127.0.0.1:18000] Qwen3-ASR-1.7B
+   |
+   +--> [ForcedAligner at FA_BASE_URL] optional, word timestamps only
 ```
 
 Why this layout:
@@ -86,9 +88,13 @@ Expected response:
 ```json
 {
   "status": "ok",
-  "backend_reachable": true
+  "backend_reachable": true,
+  "fa_configured": false,
+  "fa_reachable": false
 }
 ```
+
+`fa_configured` is true when `FA_BASE_URL` is set. `fa_reachable` is true only when that URL answers `GET /health`. A stopped aligner does not make this container unhealthy: the compose check still requires only `backend_reachable`.
 
 ## API Example
 
@@ -110,7 +116,7 @@ curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
   -F "timestamp_granularities[]=segment"
 ```
 
-Verbose response with word timestamps:
+Verbose response with word timestamps. This calls the external aligner once per chunk and requires `FA_BASE_URL`:
 
 ```bash
 curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
@@ -132,6 +138,13 @@ The facade API performs the following steps:
 5. merge text and segment offsets back into a single timeline
 6. return an OpenAI-style response
 
+`timestamp_granularities` selects one of two paths:
+
+- `segment` only, or omitted: ASR only. The aligner is not called. `verbose_json` segments cover each chunk and have no top-level `words`.
+- `word` included: after each chunk is transcribed and cleaned, that chunk wav and its cleaned sentence are sent to `POST {FA_BASE_URL}/align`. Word times are shifted onto the original timeline. Segment text and the top-level `text` stay the ASR sentence.
+
+If `word` is requested and `FA_BASE_URL` is empty, the API returns `503` before converting audio. If a chunk is longer than `FA_MAX_AUDIO_SECONDS` (default 180), the API returns `400` and asks for a lower `CHUNK_SECONDS`. If the aligner times out or returns an error, the whole transcription fails with `500`. The API does not fall back to text without word times.
+
 ## Environment Variables
 
 The main settings are documented in `.env.example`.
@@ -146,7 +159,9 @@ The main settings are documented in `.env.example`.
 - `DEFAULT_LANGUAGE`: default transcription language used by the API and test script
 - `CHUNK_SECONDS`: chunk size for long audio
 - `CHUNK_OVERLAP_SECONDS`: overlap between adjacent chunks
-- `MAX_CONCURRENT_CHUNKS`: maximum number of audio chunks transcribed at the same time
+- `MAX_CONCURRENT_CHUNKS`: maximum number of audio chunks transcribed at the same time. When word timestamps are requested, alignment of a chunk stays inside this same limit.
+- `FA_BASE_URL`: base URL of the external ForcedAligner. Leave empty to run ASR only. From this container, a host-published aligner is `http://host.docker.internal:<port>`, not `127.0.0.1`.
+- `FA_MAX_AUDIO_SECONDS`: maximum chunk length accepted for word alignment. Default is 180. Lower `CHUNK_SECONDS` to stay within it.
 
 For throughput tuning, start with `MAX_CONCURRENT_CHUNKS=2`. If vLLM logs still show
 low GPU memory use and only one running request, increase it gradually. If latency

@@ -13,3 +13,5 @@ workspace/*
 !workspace/.gitkeep
 
 scripts/outputs/
+
+local/
