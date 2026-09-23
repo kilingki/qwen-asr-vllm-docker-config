@@ -30,6 +30,7 @@ Why this layout:
 - `.env.example`: environment variables for ports, model paths, and chunking
 - `asr-api/`: FastAPI facade image and app code
 - `scripts/test_qwen_asr_youtube.py`: test script that downloads YouTube audio and sends it to the facade API
+- `scripts/test_asr_for_fa_input.py`: test script that builds external alignment inputs from a YouTube download
 - `data/`: runtime scratch storage for uploaded and converted audio
 
 ## Requirements
@@ -173,7 +174,7 @@ The main settings are documented in `.env.example`.
 - `ASR_GPU_MEMORY_UTILIZATION`: GPU memory fraction passed to `qwen-asr-serve`
 - `ASR_MAX_MODEL_LEN`: `--max-model-len` passed to `qwen-asr-serve`
 - `ASR_GENERATION_CONFIG`: `--generation-config` passed to `qwen-asr-serve`
-- `DEFAULT_LANGUAGE`: default transcription language used by the API and test script
+- `DEFAULT_LANGUAGE`: default transcription language used by the API and test scripts
 - `CHUNK_SECONDS`: chunk size for long audio
 - `CHUNK_OVERLAP_SECONDS`: overlap between adjacent chunks
 - `MAX_CONCURRENT_CHUNKS`: maximum number of audio chunks transcribed at the same time
@@ -186,9 +187,11 @@ For throughput tuning, start with `MAX_CONCURRENT_CHUNKS=2`. If vLLM logs still 
 low GPU memory use and only one running request, increase it gradually. If latency
 or memory pressure gets worse, reduce it back to `1`.
 
-## Test Script
+## Test Scripts
 
-The repository includes a test script that downloads audio from YouTube and sends the full file to the public facade API. The host needs `yt-dlp` and `curl`.
+### Transcription
+
+`scripts/test_qwen_asr_youtube.py` downloads audio from YouTube and sends the full file to the public facade API. The host needs `yt-dlp` and `curl`.
 
 ```bash
 python3 scripts/test_qwen_asr_youtube.py
@@ -214,6 +217,34 @@ Generated output files:
 - `<audio>.clean.txt`: cleaned transcript text without timestamps, intended for reading or downstream text processing.
 - `<audio>.txt`, `<audio>.srt`, or `<audio>.vtt`: plain text or subtitle output when `STT_RESPONSE_FORMAT` is set to `text`, `srt`, or `vtt`.
 
+### Alignment inputs
+
+`scripts/test_asr_for_fa_input.py` downloads the same kind of YouTube audio, normalizes it once, and writes the files an external service would send to FA. The host needs `yt-dlp`, `ffmpeg`, and `curl`. The script does not call an aligner.
+
+```bash
+python3 scripts/test_asr_for_fa_input.py
+```
+
+Set the YouTube URL directly at the top of `scripts/test_asr_for_fa_input.py`. The request is fixed to `response_format=verbose_json` and `include_chunks=true`. Adjust these values in `.env` if needed:
+
+- `STT_BASE_URL`
+- `STT_MODEL`
+- `DEFAULT_LANGUAGE`
+- `STT_HEALTH_RETRIES`
+- `STT_HEALTH_BACKOFF_SEC`
+- `STT_REQUEST_TIMEOUT_SECONDS`
+- `STT_OUTPUT_DIR`
+
+Outputs are saved under `scripts/outputs/alignment/` by default (`STT_OUTPUT_DIR` plus `alignment`).
+
+Generated files:
+
+- `source.wav`: 16 kHz, mono, signed 16-bit PCM WAV uploaded to ASR. This is the file later slices are cut from.
+- `response.json`: full `verbose_json` body, including `audio` and `chunks`.
+- `chunks/chunk-NNNN.wav`: PCM slice for `[start_sample, end_sample)`.
+- `chunks/chunk-NNNN.txt`: that chunk's `text`, unchanged. Empty `text` is not written.
+- `manifest.json`: `sample_rate`, `channels`, `num_samples`, kept chunk paths, and `skipped_empty` indexes.
+
 ## External alignment
 
 This container does not call a forced aligner. An external service can send the same audio to FA after ASR:
@@ -224,6 +255,8 @@ This container does not call a forced aligner. An external service can send the 
 4. Send each range and its `text` to FA. Skip chunks whose `text` is empty.
 5. Add `start_sample / sample_rate` to the FA times.
 6. Remove overlap duplicates after FA returns. Do not dedupe chunk text before that.
+
+`scripts/test_asr_for_fa_input.py` performs steps 1-4 and leaves steps 5-6 for after FA returns. Chunk text in `chunks/*.txt` is the pre-merge text. Do not remove overlap duplicates from those files before alignment.
 
 The ASR server does not check the FA input limit. Match `CHUNK_SECONDS` to what FA accepts in the deployment configuration. Segment timestamps in the ASR response remain approximate chunk times.
 
