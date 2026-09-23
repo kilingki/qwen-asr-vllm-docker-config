@@ -62,12 +62,15 @@ If you already downloaded the models to the following paths, no extra download s
 cp .env.example .env
 ```
 
-2. Review the model directory and GPU settings in `.env`.
+2. Review the model directory and GPU memory setting in `.env`.
 
 ```env
 MODEL_HOST_DIR=../models/stt/hf
 ASR_MODEL_PATH=/models/Qwen3-ASR-1.7B
+ASR_GPU_MEMORY_UTILIZATION=0.72
 ```
+
+The GPU device is fixed to `0` in `docker-compose.yml` (`NVIDIA_VISIBLE_DEVICES` and `CUDA_VISIBLE_DEVICES`).
 
 3. Build and start the ASR container.
 
@@ -133,22 +136,26 @@ The facade API performs the following steps:
 5. merge text and segment offsets back into a single timeline
 6. return an OpenAI-style response
 
-`timestamp_granularities` accepts `segment` or may be omitted. Both use the ASR-only path. `verbose_json` segments are chunk-based approximate times, not precise speech or word times. A request that includes `word`, including `segment,word`, returns HTTP 400 before conversion or inference. This server does not provide word timestamps.
+`GET /v1/models` returns the model list from the internal Qwen server.
 
-`include_chunks` defaults to false. Omitted or false requests keep the ffmpeg conversion path and the existing `json`, `text`, `verbose_json`, `srt`, and `vtt` bodies. `json` stays `{text}` and does not gain `audio` or `chunks`.
+`language` defaults to `DEFAULT_LANGUAGE` (`ko` unless changed). `prompt` is forwarded to the internal Qwen server. `temperature` is accepted and ignored.
+
+`timestamp_granularities` accepts `segment` or may be omitted. Both use the ASR-only path. `verbose_json` segments are chunk-based approximate times, not precise speech or word times. Each segment includes `"words": []`. The top-level body has no `words` field. A request that includes `word`, including `segment,word`, returns HTTP 400 before conversion or inference. This server does not provide word timestamps.
+
+`include_chunks` defaults to false when omitted. False values are an empty string, `0`, `false`, `no`, and `off`. Those requests keep the ffmpeg conversion path and the existing `json`, `text`, `verbose_json`, `srt`, and `vtt` bodies. `json` stays `{text}` and does not gain `audio` or `chunks`. True values are `1`, `true`, `yes`, and `on`. Any other value returns HTTP 400.
 
 `include_chunks=true` is allowed only with `response_format=verbose_json`. Any other format returns HTTP 400. The file must be 16 kHz, mono, signed 16-bit PCM WAV. The server reads the WAV header, not the extension or MIME type. A different format returns HTTP 400 and is not resampled or downmixed. Matching input is sliced by frame count with `CHUNK_SECONDS` and `CHUNK_OVERLAP_SECONDS`. Those slices are the audio sent to ASR. The response adds:
 
 ```json
 {
-  "audio": {"sample_rate": 16000, "channels": 1, "num_samples": 3840000},
+  "audio": {"sample_rate": 16000, "channels": 1, "num_samples": 1920000},
   "chunks": [
     {"index": 0, "start_sample": 0, "end_sample": 1920000, "text": "첫 청크 전사문", "language": "ko"}
   ]
 }
 ```
 
-`start_sample` and `end_sample` are integer indexes into that PCM, half-open as `[start_sample, end_sample)`. `chunks` are ordered by index. A silent or fully filtered chunk stays in the list with `text` set to `""`. `chunks[].text` is the cleaned text of that chunk before cross-chunk merge and overlap removal. `text` and `segments` are still the merged ASR result. The response does not include paths, internal URLs, or base64 chunk audio.
+That example is one 120-second chunk, which fits the default `CHUNK_SECONDS`. Longer audio returns one object per slice. `start_sample` and `end_sample` are integer indexes into that PCM, half-open as `[start_sample, end_sample)`. `chunks` are ordered by index. A silent or fully filtered chunk stays in the list with `text` set to `""`. `chunks[].text` is the cleaned text of that chunk before cross-chunk merge and overlap removal. `chunks[].language` is null when neither the backend nor the request supplies a language. `text` and `segments` are still the merged ASR result. The response does not include paths, internal URLs, or base64 chunk audio.
 
 Cleanup can drop repeated non-speech tails and other ASR garbage. That can also remove real speech, so an empty chunk text does not prove the audio was silent.
 
@@ -163,10 +170,17 @@ The main settings are documented in `.env.example`.
 - `ASR_MODEL_PATH`: container path to `Qwen3-ASR-1.7B`
 - `ASR_BASE_URL`: internal base URL used by the facade
 - `ASR_MODEL`: served model name exposed by the Qwen server
+- `ASR_GPU_MEMORY_UTILIZATION`: GPU memory fraction passed to `qwen-asr-serve`
+- `ASR_MAX_MODEL_LEN`: `--max-model-len` passed to `qwen-asr-serve`
+- `ASR_GENERATION_CONFIG`: `--generation-config` passed to `qwen-asr-serve`
 - `DEFAULT_LANGUAGE`: default transcription language used by the API and test script
 - `CHUNK_SECONDS`: chunk size for long audio
 - `CHUNK_OVERLAP_SECONDS`: overlap between adjacent chunks
-- `MAX_CONCURRENT_CHUNKS`: maximum number of audio chunks transcribed at the same time.
+- `MAX_CONCURRENT_CHUNKS`: maximum number of audio chunks transcribed at the same time
+- `REQUEST_TIMEOUT_SECONDS`: facade timeout for each internal ASR request
+- `LOG_LEVEL`: uvicorn log level
+
+Compose and `.env.example` set `MAX_CONCURRENT_CHUNKS=2`. If the variable is unset and the app is started outside Compose, the code fallback is `4`.
 
 For throughput tuning, start with `MAX_CONCURRENT_CHUNKS=2`. If vLLM logs still show
 low GPU memory use and only one running request, increase it gradually. If latency
@@ -174,7 +188,7 @@ or memory pressure gets worse, reduce it back to `1`.
 
 ## Test Script
 
-The repository includes a test script that downloads audio from YouTube and sends the full file to the public facade API.
+The repository includes a test script that downloads audio from YouTube and sends the full file to the public facade API. The host needs `yt-dlp` and `curl`.
 
 ```bash
 python3 scripts/test_qwen_asr_youtube.py
@@ -186,6 +200,9 @@ Set the YouTube URL directly at the top of `scripts/test_qwen_asr_youtube.py`, a
 - `STT_MODEL`
 - `STT_RESPONSE_FORMAT`
 - `STT_TIMESTAMP_GRANULARITIES`
+- `STT_HEALTH_RETRIES`
+- `STT_HEALTH_BACKOFF_SEC`
+- `STT_REQUEST_TIMEOUT_SECONDS`
 - `STT_OUTPUT_DIR`
 
 By default the script requests `verbose_json` with segment timestamps. Generated outputs are saved to `scripts/outputs/` by default, and that directory is excluded from git tracking.
@@ -213,3 +230,4 @@ The ASR server does not check the FA input limit. Match `CHUNK_SECONDS` to what 
 ## Notes
 
 - Only `ASR_API_PORT` is published to the host. The internal Qwen server defaults to `127.0.0.1:18000` inside the container, so it does not conflict with other host services on port `8000`.
+- GPU selection is device `0` only, set in `docker-compose.yml`.
