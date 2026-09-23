@@ -12,6 +12,6 @@ data/*
 workspace/*
 !workspace/.gitkeep
 
-scripts/outputs/
+tests/outputs/
 
 local/
