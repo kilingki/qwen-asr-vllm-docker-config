@@ -6,18 +6,16 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from .asr_client import QwenAsrClient
-from .audio import convert_to_wav, save_upload
+from .audio import PcmFormatError, convert_to_wav, inspect_pcm_wav, save_upload
 from .config import (
     ASR_BASE_URL,
     ASR_MODEL,
     DEFAULT_LANGUAGE,
-    FA_BASE_URL,
     REQUEST_TIMEOUT_SECONDS,
     SUPPORTED_RESPONSE_FORMATS,
     SUPPORTED_TIMESTAMP_GRANULARITIES,
     TMP_DIR,
 )
-from .fa_client import ForcedAlignerClient
 from .formatter import (
     to_json_response,
     to_srt,
@@ -33,33 +31,26 @@ app = FastAPI(
 )
 
 asr_client: QwenAsrClient | None = None
-fa_client: ForcedAlignerClient | None = None
 pipeline: TranscriptionPipeline | None = None
+
+WORD_TIMESTAMPS_DETAIL = "This server does not provide word timestamps."
 
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    global asr_client, fa_client, pipeline
+    global asr_client, pipeline
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     asr_client = QwenAsrClient(
         base_url=ASR_BASE_URL,
         timeout_seconds=REQUEST_TIMEOUT_SECONDS,
     )
-    fa_client = None
-    if FA_BASE_URL:
-        fa_client = ForcedAlignerClient(
-            base_url=FA_BASE_URL,
-            timeout_seconds=REQUEST_TIMEOUT_SECONDS,
-        )
-    pipeline = TranscriptionPipeline(asr_client=asr_client, fa_client=fa_client)
+    pipeline = TranscriptionPipeline(asr_client=asr_client)
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
     if asr_client is not None:
         await asr_client.close()
-    if fa_client is not None:
-        await fa_client.close()
 
 
 @app.get("/health")
@@ -72,16 +63,9 @@ async def health() -> dict[str, Any]:
     except Exception:
         backend_reachable = False
 
-    fa_configured = bool(FA_BASE_URL)
-    fa_reachable = False
-    if fa_configured and fa_client is not None:
-        fa_reachable = await fa_client.reachable()
-
     return {
         "status": "ok",
         "backend_reachable": backend_reachable,
-        "fa_configured": fa_configured,
-        "fa_reachable": fa_reachable,
     }
 
 
@@ -103,52 +87,63 @@ async def create_transcription(
     response_format: str = Form(default="json"),
 ) -> JSONResponse | PlainTextResponse:
     del temperature
-
-    if response_format not in SUPPORTED_RESPONSE_FORMATS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported response_format: {response_format}",
-        )
-
-    form = await request.form()
-    timestamp_granularities = form.getlist("timestamp_granularities[]")
-    if not timestamp_granularities:
-        timestamp_granularities = form.getlist("timestamp_granularities")
-    if not timestamp_granularities:
-        timestamp_granularities = ["segment"]
-
-    unsupported_granularities = sorted(
-        set(timestamp_granularities) - SUPPORTED_TIMESTAMP_GRANULARITIES
-    )
-    if unsupported_granularities:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Unsupported timestamp_granularities: "
-                + ", ".join(unsupported_granularities)
-            ),
-        )
-
-    if "word" in timestamp_granularities and fa_client is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Forced aligner is not configured",
-        )
-
-    assert pipeline is not None
-
-    filename = Path(file.filename or "upload.bin").name
-    suffix = Path(filename).suffix or ".bin"
-    effective_language = language or DEFAULT_LANGUAGE or None
-
     try:
+        if response_format not in SUPPORTED_RESPONSE_FORMATS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported response_format: {response_format}",
+            )
+
+        form = await request.form()
+        timestamp_granularities = form.getlist("timestamp_granularities[]")
+        if not timestamp_granularities:
+            timestamp_granularities = form.getlist("timestamp_granularities")
+        if not timestamp_granularities:
+            timestamp_granularities = ["segment"]
+
+        if "word" in timestamp_granularities:
+            raise HTTPException(status_code=400, detail=WORD_TIMESTAMPS_DETAIL)
+
+        unsupported_granularities = sorted(
+            set(timestamp_granularities) - SUPPORTED_TIMESTAMP_GRANULARITIES
+        )
+        if unsupported_granularities:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Unsupported timestamp_granularities: "
+                    + ", ".join(unsupported_granularities)
+                ),
+            )
+
+        include_chunks = _form_flag(form.get("include_chunks"))
+        if include_chunks and response_format != "verbose_json":
+            raise HTTPException(
+                status_code=400,
+                detail="include_chunks=true requires response_format=verbose_json",
+            )
+
+        assert pipeline is not None
+
+        filename = Path(file.filename or "upload.bin").name
+        suffix = Path(filename).suffix or ".bin"
+        effective_language = language or DEFAULT_LANGUAGE or None
+
         with tempfile.TemporaryDirectory(dir=TMP_DIR) as tmp_dir:
             tmp_root = Path(tmp_dir)
             upload_path = tmp_root / f"upload{suffix}"
-            wav_path = tmp_root / "input.wav"
-
             await save_upload(file, upload_path)
-            convert_to_wav(upload_path, wav_path)
+
+            pcm = None
+            if include_chunks:
+                try:
+                    pcm = inspect_pcm_wav(upload_path)
+                except PcmFormatError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                wav_path = upload_path
+            else:
+                wav_path = tmp_root / "input.wav"
+                convert_to_wav(upload_path, wav_path)
 
             result = await pipeline.transcribe(
                 wav_path=wav_path,
@@ -156,6 +151,7 @@ async def create_transcription(
                 language=effective_language,
                 prompt=prompt,
                 timestamp_granularities=timestamp_granularities,
+                pcm=pcm,
             )
 
         if response_format == "json":
@@ -176,3 +172,19 @@ async def create_transcription(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         await file.close()
+
+
+def _form_flag(value: Any) -> bool:
+    if value is None:
+        return False
+    if not isinstance(value, str):
+        raise HTTPException(status_code=400, detail="Invalid include_chunks value")
+    text = value.strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"", "0", "false", "no", "off"}:
+        return False
+    raise HTTPException(
+        status_code=400,
+        detail=f"Invalid include_chunks value: {value}",
+    )

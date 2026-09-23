@@ -3,18 +3,13 @@ import re
 from pathlib import Path
 from typing import Any
 
-from fastapi import HTTPException
-
 from .asr_client import QwenAsrClient
-from .audio import AudioChunk, create_chunks, probe_duration
+from .audio import AudioChunk, PcmWav, create_chunks, create_pcm_chunks, probe_duration
 from .config import (
     CHUNK_OVERLAP_SECONDS,
     CHUNK_SECONDS,
-    DEFAULT_LANGUAGE,
-    FA_MAX_AUDIO_SECONDS,
     MAX_CONCURRENT_CHUNKS,
 )
-from .fa_client import ForcedAlignerClient, to_fa_language
 
 
 PUNCTUATION = {".", "!", "?", ",", ";", ":", "。", "！", "？", "，", "、"}
@@ -76,13 +71,8 @@ TEXT_TOKEN_RE = re.compile(r"[\uac00-\ud7afA-Za-z0-9]+")
 
 
 class TranscriptionPipeline:
-    def __init__(
-        self,
-        asr_client: QwenAsrClient,
-        fa_client: ForcedAlignerClient | None = None,
-    ) -> None:
+    def __init__(self, asr_client: QwenAsrClient) -> None:
         self.asr_client = asr_client
-        self.fa_client = fa_client
 
     async def transcribe(
         self,
@@ -91,18 +81,31 @@ class TranscriptionPipeline:
         language: str | None,
         prompt: str | None,
         timestamp_granularities: list[str],
+        pcm: PcmWav | None = None,
     ) -> dict[str, Any]:
-        duration = probe_duration(wav_path)
-        chunks = create_chunks(
-            source_wav=wav_path,
-            chunks_dir=wav_path.parent / "chunks",
-            chunk_seconds=CHUNK_SECONDS,
-            overlap_seconds=CHUNK_OVERLAP_SECONDS,
-        )
+        if pcm is not None:
+            duration = pcm.num_samples / pcm.sample_rate
+            chunks = create_pcm_chunks(
+                source_wav=wav_path,
+                chunks_dir=wav_path.parent / "chunks",
+                chunk_seconds=CHUNK_SECONDS,
+                overlap_seconds=CHUNK_OVERLAP_SECONDS,
+                sample_rate=pcm.sample_rate,
+                num_samples=pcm.num_samples,
+            )
+        else:
+            duration = probe_duration(wav_path)
+            chunks = create_chunks(
+                source_wav=wav_path,
+                chunks_dir=wav_path.parent / "chunks",
+                chunk_seconds=CHUNK_SECONDS,
+                overlap_seconds=CHUNK_OVERLAP_SECONDS,
+            )
 
         merged_language = language
         merged_text = ""
         merged_segments: list[dict[str, Any]] = []
+        chunk_results: list[dict[str, Any]] = []
 
         normalized_results = await self._transcribe_chunks(
             chunks=chunks,
@@ -115,6 +118,17 @@ class TranscriptionPipeline:
         for chunk, normalized in zip(chunks, normalized_results, strict=True):
             if not merged_language:
                 merged_language = normalized.get("language") or language
+
+            if pcm is not None:
+                chunk_results.append(
+                    {
+                        "index": chunk.index,
+                        "start_sample": chunk.start_sample,
+                        "end_sample": chunk.end_sample,
+                        "text": _join_segment_texts(normalized.get("segments") or []),
+                        "language": normalized.get("language") or language or None,
+                    }
+                )
 
             merged_text = _merge_text(merged_text, normalized["text"])
             dedupe_before = 0.0 if chunk.index == 0 else chunk.start + CHUNK_OVERLAP_SECONDS
@@ -133,12 +147,21 @@ class TranscriptionPipeline:
                 if segment_text:
                     merged_text = _merge_text(merged_text, segment_text)
 
-        return {
+        result: dict[str, Any] = {
             "text": merged_text.strip(),
             "language": merged_language,
             "duration": duration,
             "segments": _reindex_segments(merged_segments),
         }
+        if pcm is not None:
+            chunk_results.sort(key=lambda item: item["index"])
+            result["audio"] = {
+                "sample_rate": pcm.sample_rate,
+                "channels": pcm.channels,
+                "num_samples": pcm.num_samples,
+            }
+            result["chunks"] = chunk_results
+        return result
 
     async def _transcribe_chunks(
         self,
@@ -160,50 +183,9 @@ class TranscriptionPipeline:
                     timestamp_granularities=timestamp_granularities,
                 )
                 normalized = self._normalize_backend_result(raw_result, chunk)
-                cleaned = _clean_normalized_result(normalized)
-                if "word" in timestamp_granularities:
-                    await self._align_chunk(chunk, cleaned, language)
-                return cleaned
+                return _clean_normalized_result(normalized)
 
         return await asyncio.gather(*(transcribe_one(chunk) for chunk in chunks))
-
-    async def _align_chunk(
-        self,
-        chunk: AudioChunk,
-        cleaned: dict[str, Any],
-        request_language: str | None,
-    ) -> None:
-        if chunk.duration > FA_MAX_AUDIO_SECONDS:
-            limit = int(FA_MAX_AUDIO_SECONDS)
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Chunk duration {chunk.duration:.3f}s exceeds "
-                    f"FA_MAX_AUDIO_SECONDS={FA_MAX_AUDIO_SECONDS:g}. "
-                    f"Set CHUNK_SECONDS to {limit} or less."
-                ),
-            )
-
-        segments = cleaned.get("segments") or []
-        chunk_text = _join_segment_texts(segments)
-        if not chunk_text:
-            for segment in segments:
-                segment["words"] = []
-            return
-
-        if self.fa_client is None:
-            raise HTTPException(
-                status_code=503,
-                detail="Forced aligner is not configured",
-            )
-
-        language = cleaned.get("language") or request_language or DEFAULT_LANGUAGE
-        words = await self.fa_client.align(
-            chunk.path,
-            chunk_text,
-            to_fa_language(str(language)),
-        )
-        _assign_aligned_words(segments, words)
 
     def _normalize_backend_result(
         self,
@@ -308,29 +290,6 @@ def _join_segment_texts(segments: list[dict[str, Any]]) -> str:
     )
     parts = [str(item.get("text", "")).strip() for item in ordered]
     return " ".join(part for part in parts if part)
-
-
-def _assign_aligned_words(
-    segments: list[dict[str, Any]],
-    words: list[dict[str, Any]],
-) -> None:
-    if len(segments) == 1:
-        segments[0]["words"] = words
-    else:
-        for segment in segments:
-            segment["words"] = _words_for_segment(
-                words,
-                start=_as_float(segment.get("start"), 0.0),
-                end=_as_float(segment.get("end"), 0.0),
-            )
-
-    for segment in segments:
-        segment_words = segment.get("words") or []
-        if not segment_words:
-            segment["words"] = []
-            continue
-        segment["start"] = min(word["start"] for word in segment_words)
-        segment["end"] = max(word["end"] for word in segment_words)
 
 
 def _words_for_segment(

@@ -13,9 +13,10 @@ def to_verbose_json_response(result: dict[str, Any]) -> dict[str, Any]:
         "text": result["text"],
         "segments": result.get("segments", []),
     }
-    words = _flatten_words(result.get("segments", []))
-    if words:
-        response["words"] = words
+    if "audio" in result:
+        response["audio"] = result["audio"]
+    if "chunks" in result:
+        response["chunks"] = result["chunks"]
     return response
 
 
@@ -41,14 +42,6 @@ def to_vtt(result: dict[str, Any]) -> str:
         text = seg["text"].strip()
         lines.append(f"{start} --> {end}\n{text}\n")
     return "\n".join(lines)
-
-
-def _flatten_words(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    words: list[dict[str, Any]] = []
-    for segment in segments:
-        for word in segment.get("words", []):
-            words.append(word)
-    return words
 
 
 def _format_timestamp(seconds: float, srt: bool = True) -> str:

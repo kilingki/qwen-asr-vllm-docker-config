@@ -46,7 +46,7 @@ def read_env(name: str, default: str) -> str:
 
 def parse_timestamp_granularities(raw: str) -> list[str]:
     values = [item.strip() for item in raw.split(",")]
-    allowed = {"segment", "word"}
+    allowed = {"segment"}
     result: list[str] = []
     for value in values:
         if not value:
@@ -54,7 +54,7 @@ def parse_timestamp_granularities(raw: str) -> list[str]:
         if value not in allowed:
             raise RuntimeError(
                 f"Unsupported timestamp granularity: {value}. "
-                "Supported values: segment, word"
+                "Supported values: segment"
             )
         if value not in result:
             result.append(value)
@@ -71,7 +71,7 @@ MODEL = read_env("STT_MODEL", "qwen3-asr")
 LANGUAGE = read_env("DEFAULT_LANGUAGE", "ko")
 RESPONSE_FORMAT = read_env("STT_RESPONSE_FORMAT", "verbose_json")
 TIMESTAMP_GRANULARITIES = parse_timestamp_granularities(
-    read_env("STT_TIMESTAMP_GRANULARITIES", "segment,word")
+    read_env("STT_TIMESTAMP_GRANULARITIES", "segment")
 )
 RETRIES = int(read_env("STT_HEALTH_RETRIES", "30"))
 BACKOFF_SECONDS = float(read_env("STT_HEALTH_BACKOFF_SEC", "2"))
@@ -332,7 +332,6 @@ def as_float(value: Any) -> float | None:
 def print_verbose_payload(payload: dict[str, Any]) -> None:
     text = payload.get("text", "")
     segments = payload.get("segments", [])
-    words = payload.get("words", [])
 
     print("\n=== FULL TEXT ===")
     print(text.strip() if isinstance(text, str) else text)
@@ -348,16 +347,6 @@ def print_verbose_payload(payload: dict[str, Any]) -> None:
             print(f"[{start} - {end}] {seg_text}")
     else:
         print("[WARN] No segments returned.")
-
-    if isinstance(words, list) and words:
-        print("\n=== WORD TIMESTAMPS ===")
-        for word in words:
-            if not isinstance(word, dict):
-                continue
-            start = format_timestamp(word.get("start"))
-            end = format_timestamp(word.get("end"))
-            token = str(word.get("word", "")).strip()
-            print(f"[{start} - {end}] {token}")
 
 
 def print_result(result: dict[str, Any] | str) -> None:
@@ -398,20 +387,6 @@ def save_outputs(audio_path: Path, result: dict[str, Any] | str) -> None:
                 lines.append(f"[{start} - {end}] {seg_text}")
             txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             print(f"[INFO] saved_segments={txt_path}")
-
-        words = result.get("words", [])
-        if isinstance(words, list) and words:
-            words_path = OUTPUT_DIR / f"{base_name}.words.txt"
-            word_lines: list[str] = []
-            for word in words:
-                if not isinstance(word, dict):
-                    continue
-                start = format_timestamp(word.get("start"))
-                end = format_timestamp(word.get("end"))
-                token = str(word.get("word", "")).strip()
-                word_lines.append(f"[{start} - {end}] {token}")
-            words_path.write_text("\n".join(word_lines) + "\n", encoding="utf-8")
-            print(f"[INFO] saved_words={words_path}")
 
         clean_text = build_clean_transcript(result)
         if clean_text:

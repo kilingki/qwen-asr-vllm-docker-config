@@ -15,8 +15,6 @@ The runtime uses one Docker Compose service:
 [asr-api :8080]
    |
    +--> [qwen-asr-serve 127.0.0.1:18000] Qwen3-ASR-1.7B
-   |
-   +--> [ForcedAligner at FA_BASE_URL] optional, word timestamps only
 ```
 
 Why this layout:
@@ -88,13 +86,11 @@ Expected response:
 ```json
 {
   "status": "ok",
-  "backend_reachable": true,
-  "fa_configured": false,
-  "fa_reachable": false
+  "backend_reachable": true
 }
 ```
 
-`fa_configured` is true when `FA_BASE_URL` is set. `fa_reachable` is true only when that URL answers `GET /health`. A stopped aligner does not make this container unhealthy: the compose check still requires only `backend_reachable`.
+The compose healthcheck requires `backend_reachable`.
 
 ## API Example
 
@@ -116,15 +112,14 @@ curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
   -F "timestamp_granularities[]=segment"
 ```
 
-Verbose response with word timestamps. This calls the external aligner once per chunk and requires `FA_BASE_URL`:
+Chunk ranges with `verbose_json`. `include_chunks` is an extension of this API, not an OpenAI field. The upload must already be 16 kHz, mono, signed 16-bit PCM WAV. The server checks the WAV header and does not resample that request.
 
 ```bash
 curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
-  -F "file=@sample.wav" \
+  -F "file=@sample.pcm.wav" \
   -F "model=qwen3-asr" \
   -F "response_format=verbose_json" \
-  -F "timestamp_granularities[]=segment" \
-  -F "timestamp_granularities[]=word"
+  -F "include_chunks=true"
 ```
 
 ## API Behavior
@@ -132,18 +127,30 @@ curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
 The facade API performs the following steps:
 
 1. store the uploaded audio to a temporary workspace
-2. convert it into `16kHz mono wav` via `ffmpeg`
+2. on the default path, convert it into `16kHz mono wav` via `ffmpeg`
 3. split long audio into overlapping chunks
 4. call the internal Qwen server for chunks, with bounded concurrency
 5. merge text and segment offsets back into a single timeline
 6. return an OpenAI-style response
 
-`timestamp_granularities` selects one of two paths:
+`timestamp_granularities` accepts `segment` or may be omitted. Both use the ASR-only path. `verbose_json` segments are chunk-based approximate times, not precise speech or word times. A request that includes `word`, including `segment,word`, returns HTTP 400 before conversion or inference. This server does not provide word timestamps.
 
-- `segment` only, or omitted: ASR only. The aligner is not called. `verbose_json` segments cover each chunk and have no top-level `words`.
-- `word` included: after each chunk is transcribed and cleaned, that chunk wav and its cleaned sentence are sent to `POST {FA_BASE_URL}/align`. Word times are shifted onto the original timeline. Segment text and the top-level `text` stay the ASR sentence.
+`include_chunks` defaults to false. Omitted or false requests keep the ffmpeg conversion path and the existing `json`, `text`, `verbose_json`, `srt`, and `vtt` bodies. `json` stays `{text}` and does not gain `audio` or `chunks`.
 
-If `word` is requested and `FA_BASE_URL` is empty, the API returns `503` before converting audio. If a chunk is longer than `FA_MAX_AUDIO_SECONDS` (default 180), the API returns `400` and asks for a lower `CHUNK_SECONDS`. If the aligner times out or returns an error, the whole transcription fails with `500`. The API does not fall back to text without word times.
+`include_chunks=true` is allowed only with `response_format=verbose_json`. Any other format returns HTTP 400. The file must be 16 kHz, mono, signed 16-bit PCM WAV. The server reads the WAV header, not the extension or MIME type. A different format returns HTTP 400 and is not resampled or downmixed. Matching input is sliced by frame count with `CHUNK_SECONDS` and `CHUNK_OVERLAP_SECONDS`. Those slices are the audio sent to ASR. The response adds:
+
+```json
+{
+  "audio": {"sample_rate": 16000, "channels": 1, "num_samples": 3840000},
+  "chunks": [
+    {"index": 0, "start_sample": 0, "end_sample": 1920000, "text": "첫 청크 전사문", "language": "ko"}
+  ]
+}
+```
+
+`start_sample` and `end_sample` are integer indexes into that PCM, half-open as `[start_sample, end_sample)`. `chunks` are ordered by index. A silent or fully filtered chunk stays in the list with `text` set to `""`. `chunks[].text` is the cleaned text of that chunk before cross-chunk merge and overlap removal. `text` and `segments` are still the merged ASR result. The response does not include paths, internal URLs, or base64 chunk audio.
+
+Cleanup can drop repeated non-speech tails and other ASR garbage. That can also remove real speech, so an empty chunk text does not prove the audio was silent.
 
 ## Environment Variables
 
@@ -159,9 +166,7 @@ The main settings are documented in `.env.example`.
 - `DEFAULT_LANGUAGE`: default transcription language used by the API and test script
 - `CHUNK_SECONDS`: chunk size for long audio
 - `CHUNK_OVERLAP_SECONDS`: overlap between adjacent chunks
-- `MAX_CONCURRENT_CHUNKS`: maximum number of audio chunks transcribed at the same time. When word timestamps are requested, alignment of a chunk stays inside this same limit.
-- `FA_BASE_URL`: base URL of the external ForcedAligner. Leave empty to run ASR only. From this container, a host-published aligner is `http://host.docker.internal:<port>`, not `127.0.0.1`.
-- `FA_MAX_AUDIO_SECONDS`: maximum chunk length accepted for word alignment. Default is 180. Lower `CHUNK_SECONDS` to stay within it.
+- `MAX_CONCURRENT_CHUNKS`: maximum number of audio chunks transcribed at the same time.
 
 For throughput tuning, start with `MAX_CONCURRENT_CHUNKS=2`. If vLLM logs still show
 low GPU memory use and only one running request, increase it gradually. If latency
@@ -183,15 +188,27 @@ Set the YouTube URL directly at the top of `scripts/test_qwen_asr_youtube.py`, a
 - `STT_TIMESTAMP_GRANULARITIES`
 - `STT_OUTPUT_DIR`
 
-By default the script requests `verbose_json` with segment timestamps, and can also request word timestamps through `STT_TIMESTAMP_GRANULARITIES`. Generated outputs are saved to `scripts/outputs/` by default, and that directory is excluded from git tracking.
+By default the script requests `verbose_json` with segment timestamps. Generated outputs are saved to `scripts/outputs/` by default, and that directory is excluded from git tracking.
 
 Generated output files:
 
 - `<audio>.verbose_json.json`: full JSON response from the facade API, including `text`, `language`, `duration`, and timestamped `segments`.
 - `<audio>.segments.txt`: one line per segment, formatted as `[start - end] text` for quick timestamp review.
-- `<audio>.words.txt`: one line per word timestamp when `word` granularity is requested.
 - `<audio>.clean.txt`: cleaned transcript text without timestamps, intended for reading or downstream text processing.
 - `<audio>.txt`, `<audio>.srt`, or `<audio>.vtt`: plain text or subtitle output when `STT_RESPONSE_FORMAT` is set to `text`, `srt`, or `vtt`.
+
+## External alignment
+
+This container does not call a forced aligner. An external service can send the same audio to FA after ASR:
+
+1. Normalize the source to 16 kHz, mono, signed 16-bit PCM WAV once, and keep that file.
+2. Send that WAV to ASR with `include_chunks=true` and `response_format=verbose_json`.
+3. Cut the returned sample ranges from the same WAV.
+4. Send each range and its `text` to FA. Skip chunks whose `text` is empty.
+5. Add `start_sample / sample_rate` to the FA times.
+6. Remove overlap duplicates after FA returns. Do not dedupe chunk text before that.
+
+The ASR server does not check the FA input limit. Match `CHUNK_SECONDS` to what FA accepts in the deployment configuration. Segment timestamps in the ASR response remain approximate chunk times.
 
 ## Notes
 
