@@ -108,9 +108,9 @@ def wait_for_health() -> None:
     for attempt in range(1, RETRIES + 1):
         try:
             status, payload = http_json("GET", health_url)
-            backend_reachable = bool(payload.get("backend_reachable"))
-            if status == 200 and payload.get("status") == "ok" and backend_reachable:
-                print(f"[INFO] health ready: {payload}")
+            if status == 200 and payload.get("status") == "ok":
+                print(f"[INFO] facade ready: {payload}")
+                _load_model()
                 return
             print(f"[WARN] Unexpected /health payload: {payload}")
         except Exception as exc:  # noqa: BLE001
@@ -124,6 +124,25 @@ def wait_for_health() -> None:
     if last_error is not None:
         raise last_error
     raise RuntimeError("STT health endpoint unavailable")
+
+
+def _load_model() -> None:
+    req = request.Request(
+        url=f"{BASE_URL}/control/load",
+        data=b"{}",
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
+            body = resp.read().decode("utf-8")
+            payload = json.loads(body) if body else {}
+            if resp.status != 200 or payload.get("state") != "ready":
+                raise RuntimeError(f"model load did not become ready: {payload}")
+            print(f"[INFO] model loaded: {payload}")
+    except error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"model load failed status={exc.code}: {body}") from exc
 
 
 def ensure_command(name: str) -> None:

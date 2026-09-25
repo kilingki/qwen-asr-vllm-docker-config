@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd "$(dirname "$0")" && pwd)"
+cd "${root}"
+
+port="${ASR_API_PORT:-8080}"
+if [[ -f .env ]]; then
+  env_port="$(awk -F= '/^ASR_API_PORT=/{print $2}' .env | tail -n 1)"
+  if [[ -n "${env_port}" ]]; then
+    port="${env_port}"
+  fi
+fi
+
+status_url="http://127.0.0.1:${port}/control/status"
+container="asr-api"
+
+running="$(docker inspect -f '{{.State.Running}}' "${container}" 2>/dev/null || echo missing)"
+
+fetch_status() {
+  python3 - "${status_url}" <<'PY'
+import json
+import sys
+import urllib.request
+
+url = sys.argv[1]
+with urllib.request.urlopen(url, timeout=3) as response:
+    payload = json.loads(response.read().decode("utf-8"))
+print(json.dumps(payload))
+PY
+}
+
+if [[ "${running}" == "true" ]]; then
+  if ! fetch_status >/dev/null; then
+    echo "control endpoint is not reachable; leaving the running container unchanged" >&2
+    exit 1
+  fi
+  exit 0
+fi
+
+docker compose up -d --no-build --no-recreate
+
+for _ in $(seq 1 60); do
+  if payload="$(fetch_status 2>/dev/null)"; then
+    python3 - "${payload}" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+ok = (
+    payload.get("state") == "unloaded"
+    and payload.get("residency") == "not_resident"
+    and payload.get("active_requests") == 0
+)
+raise SystemExit(0 if ok else 1)
+PY
+    exit 0
+  fi
+  sleep 1
+done
+
+echo "new runtime did not report unloaded/not_resident" >&2
+exit 1

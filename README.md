@@ -12,15 +12,17 @@ The runtime uses one Docker Compose service:
 [client]
    |
    v
-[asr-api :8080]
+[asr-api :8080]  control API and transcription facade
    |
-   +--> [qwen-asr-serve 127.0.0.1:18000] Qwen3-ASR-1.7B
+   +--> [qwen-asr-serve 127.0.0.1:18000]  started only after POST /control/load
 ```
 
 Why this layout:
 
 - run only one container while keeping the Qwen backend private to that container
-- expose only one stable public API
+- start the facade without placing the model on the GPU
+- load and unload that one model through the control API
+- expose one stable public transcription API
 - normalize responses into an OpenAI-style transcription API
 - handle long-audio chunking in the facade
 
@@ -28,6 +30,7 @@ Why this layout:
 
 - `docker-compose.yml`: runtime definition for the single ASR API container
 - `.env.example`: environment variables for ports, model paths, and chunking
+- `prepare-inferswap`: start the container when it is down, or leave a running container as it is
 - `asr-api/`: FastAPI facade image and app code
 - `scripts/test_qwen_asr_youtube.py`: test script that downloads YouTube audio and sends it to the facade API
 - `scripts/test_asr_for_fa_input.py`: test script that builds external alignment inputs from a YouTube download
@@ -85,16 +88,79 @@ docker compose up --build -d
 curl http://localhost:8080/health
 ```
 
-Expected response:
+Expected response before the model is loaded:
 
 ```json
 {
   "status": "ok",
-  "backend_reachable": true
+  "backend_reachable": false
 }
 ```
 
-The compose healthcheck requires `backend_reachable`.
+`backend_reachable` is true only while the Qwen worker process is alive. The compose healthcheck treats the container as healthy when this HTTP endpoint responds, including while the model is unloaded.
+
+5. Load the model. This blocks until the worker is accepting requests.
+
+```bash
+curl -X POST http://localhost:8080/control/load \
+  -H 'Content-Type: application/json' \
+  -d '{}'
+```
+
+Expected response:
+
+```json
+{
+  "state": "ready",
+  "residency": "resident",
+  "active_requests": 0,
+  "last_error": null
+}
+```
+
+## Model control
+
+The container starts the facade only. `qwen-asr-serve` starts on `POST /control/load` and stops on `POST /control/unload`. One base URL is one model. Control requests take an empty body or `{}`.
+
+```text
+GET  /control/status
+POST /control/load
+POST /control/unload
+```
+
+`GET /control/status` returns:
+
+```json
+{
+  "state": "unloaded",
+  "residency": "not_resident",
+  "active_requests": 0,
+  "last_error": null
+}
+```
+
+`state` is `unloaded`, `loading`, `ready`, `unloading`, or `failed`. `residency` is `resident`, `not_resident`, or `unknown`. `active_requests` counts accepted transcription requests, not internal chunks. `last_error` is `null` after a successful load or unload, or `{"code","message"}` after a lifecycle failure.
+
+`POST /control/load` returns 200 with `state=ready` and `residency=resident` when the model can accept transcriptions. Calling it again while ready does not start a second worker. `POST /control/unload` returns 200 with `state=unloaded`, `residency=not_resident`, and `active_requests=0`. Calling it again in that state is a no-op. Unload returns 409 `BUSY` while a transcription is still running. A load during unload, or an unload during load, returns 409 `LIFECYCLE_CONFLICT`.
+
+Control errors use this body:
+
+```json
+{
+  "error": {
+    "code": "BUSY",
+    "message": "runtime has active inference requests"
+  }
+}
+```
+
+`POST /v1/audio/transcriptions` is accepted only while `state=ready`. Other lifecycle states return HTTP 503 for a valid transcription request. Invalid form fields still return HTTP 400.
+
+`prepare-inferswap` brings the container up when it is stopped. The new process stays unloaded until `/control/load`. If the container is already running, the script checks `/control/status` and exits 0 without restarting or unloading. If that check fails, it exits non-zero and does not recreate the container.
+
+```bash
+./prepare-inferswap
+```
 
 ## API Example
 
@@ -191,7 +257,7 @@ or memory pressure gets worse, reduce it back to `1`.
 
 ### Transcription
 
-`scripts/test_qwen_asr_youtube.py` downloads audio from YouTube and sends the full file to the public facade API. The host needs `yt-dlp` and `curl`.
+`scripts/test_qwen_asr_youtube.py` downloads audio from YouTube and sends the full file to the public facade API. The host needs `yt-dlp` and `curl`. After `GET /health` reports `status=ok`, the script calls `POST /control/load` and waits until the model is ready.
 
 ```bash
 python3 scripts/test_qwen_asr_youtube.py
@@ -219,7 +285,7 @@ Generated output files:
 
 ### Alignment inputs
 
-`scripts/test_asr_for_fa_input.py` downloads the same kind of YouTube audio, normalizes it once, and writes the files an external service would send to FA. The host needs `yt-dlp`, `ffmpeg`, and `curl`. The script does not call an aligner.
+`scripts/test_asr_for_fa_input.py` downloads the same kind of YouTube audio, normalizes it once, and writes the files an external service would send to FA. The host needs `yt-dlp`, `ffmpeg`, and `curl`. The script does not call an aligner. It loads the ASR model with `POST /control/load` after the facade is up.
 
 ```bash
 python3 scripts/test_asr_for_fa_input.py

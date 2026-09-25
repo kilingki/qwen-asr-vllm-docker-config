@@ -85,21 +85,23 @@ class TranscriptionPipeline:
     ) -> dict[str, Any]:
         if pcm is not None:
             duration = pcm.num_samples / pcm.sample_rate
-            chunks = create_pcm_chunks(
-                source_wav=wav_path,
-                chunks_dir=wav_path.parent / "chunks",
-                chunk_seconds=CHUNK_SECONDS,
-                overlap_seconds=CHUNK_OVERLAP_SECONDS,
-                sample_rate=pcm.sample_rate,
-                num_samples=pcm.num_samples,
+            chunks = await asyncio.to_thread(
+                create_pcm_chunks,
+                wav_path,
+                wav_path.parent / "chunks",
+                CHUNK_SECONDS,
+                CHUNK_OVERLAP_SECONDS,
+                pcm.sample_rate,
+                pcm.num_samples,
             )
         else:
-            duration = probe_duration(wav_path)
-            chunks = create_chunks(
-                source_wav=wav_path,
-                chunks_dir=wav_path.parent / "chunks",
-                chunk_seconds=CHUNK_SECONDS,
-                overlap_seconds=CHUNK_OVERLAP_SECONDS,
+            duration = await asyncio.to_thread(probe_duration, wav_path)
+            chunks = await asyncio.to_thread(
+                create_chunks,
+                wav_path,
+                wav_path.parent / "chunks",
+                CHUNK_SECONDS,
+                CHUNK_OVERLAP_SECONDS,
             )
 
         merged_language = language

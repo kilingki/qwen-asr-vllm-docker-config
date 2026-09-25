@@ -1,6 +1,7 @@
 import array
 import asyncio
 import os
+import sys
 import tempfile
 import threading
 import unittest
@@ -8,8 +9,16 @@ import wave
 from pathlib import Path
 from unittest.mock import patch
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO_ROOT / "asr-api"))
+sys.path.insert(0, str(_REPO_ROOT / "tests"))
+
 _TEST_ROOT = tempfile.mkdtemp(prefix="asr-facade-")
 os.environ["STORAGE_DIR"] = _TEST_ROOT
+
+from api_report import install
+
+install()
 os.environ["DEFAULT_LANGUAGE"] = "ko"
 os.environ["CHUNK_SECONDS"] = "120"
 os.environ["CHUNK_OVERLAP_SECONDS"] = "2"
@@ -19,6 +28,7 @@ from fastapi.testclient import TestClient
 
 from app import main as api
 from app.audio import AudioChunk
+from app.lifecycle import Lifecycle
 from app.pipeline import TranscriptionPipeline
 
 
@@ -196,12 +206,38 @@ class _PatchedAudio:
             item.stop()
 
 
+class _ImmediateWorker:
+    def __init__(self) -> None:
+        self.alive = False
+
+    async def start(self) -> None:
+        self.alive = True
+
+    async def stop(self) -> None:
+        self.alive = False
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+
+def _load_model(client: TestClient) -> None:
+    response = client.post("/control/load")
+    if response.status_code != 200:
+        raise AssertionError(response.text)
+
+
 class TranscriptionApiTest(unittest.TestCase):
+    def setUp(self) -> None:
+        api.lifecycle = Lifecycle(_ImmediateWorker())
+
     def test_health_reports_backend_only(self) -> None:
         with TestClient(api.app) as client:
-            api.asr_client = FakeAsr()
             body = client.get("/health").json()
+        self.assertEqual(body, {"status": "ok", "backend_reachable": False})
 
+        with TestClient(api.app) as client:
+            _load_model(client)
+            body = client.get("/health").json()
         self.assertEqual(body, {"status": "ok", "backend_reachable": True})
 
     def test_segment_request_keeps_asr_only_verbose_json(self) -> None:
@@ -209,6 +245,7 @@ class TranscriptionApiTest(unittest.TestCase):
         asr = FakeAsr({"chunk-0000.wav": "language Korean <asr_text> 첫 문장"})
         with _PatchedAudio(chunks, duration=120.0):
             with TestClient(api.app) as client:
+                _load_model(client)
                 api.pipeline = TranscriptionPipeline(asr)
                 response = client.post(
                     "/v1/audio/transcriptions",
@@ -245,6 +282,7 @@ class TranscriptionApiTest(unittest.TestCase):
                 asr = FakeAsr({"chunk-0000.wav": "language Korean <asr_text> 첫 문장"})
                 with _PatchedAudio(chunks, duration=120.0):
                     with TestClient(api.app) as client:
+                        _load_model(client)
                         api.pipeline = TranscriptionPipeline(asr)
                         response = client.post(
                             "/v1/audio/transcriptions",
@@ -268,6 +306,7 @@ class TranscriptionApiTest(unittest.TestCase):
         audio = _PatchedAudio(chunks, duration=1.0)
         with audio:
             with TestClient(api.app) as client:
+                _load_model(client)
                 api.pipeline = TranscriptionPipeline(asr)
                 response = client.post(
                     "/v1/audio/transcriptions",
@@ -290,6 +329,7 @@ class TranscriptionApiTest(unittest.TestCase):
         asr = FakeAsr({"chunk-0000.wav": "긴 문장"})
         with _PatchedAudio(chunks, duration=181.0):
             with TestClient(api.app) as client:
+                _load_model(client)
                 api.pipeline = TranscriptionPipeline(asr)
                 response = client.post(
                     "/v1/audio/transcriptions",
@@ -360,6 +400,7 @@ class TranscriptionApiTest(unittest.TestCase):
         asr = FakeAsr()
         with patch("app.main.convert_to_wav", _fail_convert):
             with TestClient(api.app) as client:
+                _load_model(client)
                 api.pipeline = TranscriptionPipeline(asr)
                 response = client.post(
                     "/v1/audio/transcriptions",
@@ -522,7 +563,7 @@ class TranscriptionApiTest(unittest.TestCase):
         self.assertEqual(used.calls, 3)
 
     def test_runtime_sources_do_not_reference_fa(self) -> None:
-        root = Path(__file__).resolve().parents[2]
+        root = _REPO_ROOT
         paths = [root / "asr-api" / "app", root / "docker-compose.yml", root / ".env.example"]
         paths.extend((root / "scripts").glob("*.py"))
         paths.append(root / "README.md")
@@ -575,6 +616,7 @@ class TranscriptionApiTest(unittest.TestCase):
             item.start()
         try:
             with TestClient(api.app) as client:
+                _load_model(client)
                 api.pipeline = TranscriptionPipeline(used)
                 response = client.post(
                     "/v1/audio/transcriptions",

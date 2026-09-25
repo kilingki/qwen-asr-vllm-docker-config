@@ -1,3 +1,5 @@
+import asyncio
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -16,6 +18,7 @@ from .config import (
     SUPPORTED_TIMESTAMP_GRANULARITIES,
     TMP_DIR,
 )
+from .lifecycle import ControlError, Lifecycle
 from .formatter import (
     to_json_response,
     to_srt,
@@ -32,6 +35,7 @@ app = FastAPI(
 
 asr_client: QwenAsrClient | None = None
 pipeline: TranscriptionPipeline | None = None
+lifecycle = Lifecycle()
 
 WORD_TIMESTAMPS_DETAIL = "This server does not provide word timestamps."
 
@@ -49,28 +53,52 @@ async def on_startup() -> None:
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
+    await lifecycle.shutdown()
     if asr_client is not None:
         await asr_client.close()
 
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    assert asr_client is not None
-    backend_reachable = False
-    try:
-        await asr_client.list_models()
-        backend_reachable = True
-    except Exception:
-        backend_reachable = False
-
     return {
         "status": "ok",
-        "backend_reachable": backend_reachable,
+        "backend_reachable": lifecycle.worker_alive(),
     }
+
+
+@app.get("/control/status")
+async def control_status() -> JSONResponse:
+    try:
+        body = await lifecycle.status()
+    except ControlError as exc:
+        return _control_error(exc)
+    return JSONResponse(body)
+
+
+@app.post("/control/load")
+async def control_load(request: Request) -> JSONResponse:
+    try:
+        await _require_empty_body(request)
+        body = await lifecycle.load()
+    except ControlError as exc:
+        return _control_error(exc)
+    return JSONResponse(body)
+
+
+@app.post("/control/unload")
+async def control_unload(request: Request) -> JSONResponse:
+    try:
+        await _require_empty_body(request)
+        body = await lifecycle.unload()
+    except ControlError as exc:
+        return _control_error(exc)
+    return JSONResponse(body)
 
 
 @app.get("/v1/models")
 async def list_models() -> JSONResponse:
+    if not lifecycle.worker_alive():
+        raise HTTPException(status_code=503, detail="model is not ready")
     assert asr_client is not None
     payload = await asr_client.list_models()
     return JSONResponse(payload)
@@ -129,8 +157,9 @@ async def create_transcription(
         suffix = Path(filename).suffix or ".bin"
         effective_language = language or DEFAULT_LANGUAGE or None
 
-        with tempfile.TemporaryDirectory(dir=TMP_DIR) as tmp_dir:
-            tmp_root = Path(tmp_dir)
+        tmp_root = Path(tempfile.mkdtemp(dir=TMP_DIR))
+        work: asyncio.Task[Any] | None = None
+        try:
             upload_path = tmp_root / f"upload{suffix}"
             await save_upload(file, upload_path)
 
@@ -143,16 +172,31 @@ async def create_transcription(
                 wav_path = upload_path
             else:
                 wav_path = tmp_root / "input.wav"
-                convert_to_wav(upload_path, wav_path)
 
-            result = await pipeline.transcribe(
-                wav_path=wav_path,
-                model=model,
-                language=effective_language,
-                prompt=prompt,
-                timestamp_granularities=timestamp_granularities,
-                pcm=pcm,
-            )
+            if not await lifecycle.try_admit():
+                raise HTTPException(status_code=503, detail="model is not ready")
+
+            async def _run_transcription() -> Any:
+                try:
+                    if pcm is None:
+                        await asyncio.to_thread(convert_to_wav, upload_path, wav_path)
+                    return await pipeline.transcribe(
+                        wav_path=wav_path,
+                        model=model,
+                        language=effective_language,
+                        prompt=prompt,
+                        timestamp_granularities=timestamp_granularities,
+                        pcm=pcm,
+                    )
+                finally:
+                    await lifecycle.release()
+                    shutil.rmtree(tmp_root, ignore_errors=True)
+
+            work = asyncio.create_task(_run_transcription())
+            result = await asyncio.shield(work)
+        finally:
+            if work is None:
+                shutil.rmtree(tmp_root, ignore_errors=True)
 
         if response_format == "json":
             return JSONResponse(to_json_response(result))
@@ -172,6 +216,20 @@ async def create_transcription(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         await file.close()
+
+
+async def _require_empty_body(request: Request) -> None:
+    raw = await request.body()
+    if raw.strip() in {b"", b"{}"}:
+        return
+    raise ControlError(400, "BAD_REQUEST", "request body must be empty or {}")
+
+
+def _control_error(exc: ControlError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": {"code": exc.code, "message": exc.message}},
+    )
 
 
 def _form_flag(value: Any) -> bool:
