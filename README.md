@@ -1,6 +1,24 @@
 # qwen-asr-vllm-docker-config
 
-This project provides a practical single-container Docker deployment for Qwen3-ASR with an OpenAI-compatible facade API.
+This project provides a practical single-container Docker deployment for [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) with an OpenAI-compatible facade API. The internal server is [`qwen-asr-serve`](https://github.com/QwenLM/Qwen3-ASR) from the `qwen-asr` package, which serves the model through [vLLM](https://github.com/vllm-project/vllm).
+
+This repository is [MIT](LICENSE). The model weights are [Apache 2.0](https://huggingface.co/Qwen/Qwen3-ASR-1.7B).
+
+## Contents
+
+- [Architecture](#architecture)
+- [Project Structure](#project-structure)
+- [Requirements](#requirements)
+- [Model Download](#model-download)
+- [Quick Start](#quick-start)
+- [Model control](#model-control)
+- [API Example](#api-example)
+- [API Behavior](#api-behavior)
+- [Environment Variables](#environment-variables)
+- [Test Scripts](#test-scripts)
+- [External alignment](#external-alignment)
+- [Troubleshooting](#troubleshooting)
+- [Notes](#notes)
 
 The runtime uses one Docker Compose service:
 
@@ -32,16 +50,17 @@ Why this layout:
 - `.env.example`: environment variables for ports, model paths, and chunking
 - `prepare-inferswap`: start the container when it is down, or leave a running container as it is
 - `asr-api/`: FastAPI facade image and app code
-- `scripts/test_qwen_asr_youtube.py`: test script that downloads YouTube audio and sends it to the facade API
-- `scripts/test_asr_for_fa_input.py`: test script that builds external alignment inputs from a YouTube download
+- `tests/test_qwen_asr_youtube.py`: test script that downloads YouTube audio and sends it to the facade API
+- `tests/test_asr_for_fa_input.py`: test script that builds external alignment inputs from a YouTube download
 - `data/`: runtime scratch storage for uploaded and converted audio
 
 ## Requirements
 
-- NVIDIA GPU
-- NVIDIA Container Toolkit
+- NVIDIA GPU with about 20 GiB free. A local load of `Qwen3-ASR-1.7B` with the defaults in `.env.example` (`ASR_GPU_MEMORY_UTILIZATION=0.72`, `ASR_MAX_MODEL_LEN=10000`) used about 20 GiB. vLLM reserves that fraction of the visible device, so a smaller card needs a lower fraction and may also need a lower `ASR_MAX_MODEL_LEN`.
+- NVIDIA driver that supports the image CUDA version, `nvidia/cuda:12.1.1`
+- NVIDIA Container Toolkit (`docker-compose.yml` sets `runtime: nvidia`)
 - Docker / Docker Compose
-- Hugging Face access for model download
+- Hugging Face CLI (`hf`) for the model download below
 
 ## Model Download
 
@@ -257,13 +276,13 @@ or memory pressure gets worse, reduce it back to `1`.
 
 ### Transcription
 
-`scripts/test_qwen_asr_youtube.py` downloads audio from YouTube and sends the full file to the public facade API. The host needs `yt-dlp` and `curl`. After `GET /health` reports `status=ok`, the script calls `POST /control/load` and waits until the model is ready.
+`tests/test_qwen_asr_youtube.py` downloads audio from YouTube and sends the full file to the public facade API. The host needs `yt-dlp` and `curl`. After `GET /health` reports `status=ok`, the script calls `POST /control/load` and waits until the model is ready.
 
 ```bash
-python3 scripts/test_qwen_asr_youtube.py
+python3 tests/test_qwen_asr_youtube.py
 ```
 
-Set the YouTube URL directly at the top of `scripts/test_qwen_asr_youtube.py`, and adjust these values in `.env` if needed:
+Set the YouTube URL directly at the top of `tests/test_qwen_asr_youtube.py`, and adjust these values in `.env` if needed:
 
 - `STT_BASE_URL`
 - `STT_MODEL`
@@ -274,7 +293,7 @@ Set the YouTube URL directly at the top of `scripts/test_qwen_asr_youtube.py`, a
 - `STT_REQUEST_TIMEOUT_SECONDS`
 - `STT_OUTPUT_DIR`
 
-By default the script requests `verbose_json` with segment timestamps. Generated outputs are saved to `scripts/outputs/` by default, and that directory is excluded from git tracking.
+By default the script requests `verbose_json` with segment timestamps. Generated outputs follow `STT_OUTPUT_DIR`. `.env.example` sets that to `./scripts/outputs`, which is also the script fallback when the variable is unset. `.gitignore` ignores `tests/outputs/`.
 
 Generated output files:
 
@@ -285,13 +304,13 @@ Generated output files:
 
 ### Alignment inputs
 
-`scripts/test_asr_for_fa_input.py` downloads the same kind of YouTube audio, normalizes it once, and writes the files an external service would send to FA. The host needs `yt-dlp`, `ffmpeg`, and `curl`. The script does not call an aligner. It loads the ASR model with `POST /control/load` after the facade is up.
+`tests/test_asr_for_fa_input.py` downloads the same kind of YouTube audio, normalizes it once, and writes the files an external service would send to FA. The host needs `yt-dlp`, `ffmpeg`, and `curl`. The script does not call an aligner. It loads the ASR model with `POST /control/load` after the facade is up.
 
 ```bash
-python3 scripts/test_asr_for_fa_input.py
+python3 tests/test_asr_for_fa_input.py
 ```
 
-Set the YouTube URL directly at the top of `scripts/test_asr_for_fa_input.py`. The request is fixed to `response_format=verbose_json` and `include_chunks=true`. Adjust these values in `.env` if needed:
+Set the YouTube URL directly at the top of `tests/test_asr_for_fa_input.py`. The request is fixed to `response_format=verbose_json` and `include_chunks=true`. Adjust these values in `.env` if needed:
 
 - `STT_BASE_URL`
 - `STT_MODEL`
@@ -322,9 +341,16 @@ This container does not call a forced aligner. An external service can send the 
 5. Add `start_sample / sample_rate` to the FA times.
 6. Remove overlap duplicates after FA returns. Do not dedupe chunk text before that.
 
-`scripts/test_asr_for_fa_input.py` performs steps 1-4 and leaves steps 5-6 for after FA returns. Chunk text in `chunks/*.txt` is the pre-merge text. Do not remove overlap duplicates from those files before alignment.
+`tests/test_asr_for_fa_input.py` performs steps 1-4 and leaves steps 5-6 for after FA returns. Chunk text in `chunks/*.txt` is the pre-merge text. Do not remove overlap duplicates from those files before alignment.
 
 The ASR server does not check the FA input limit. Match `CHUNK_SECONDS` to what FA accepts in the deployment configuration. Segment timestamps in the ASR response remain approximate chunk times.
+
+## Troubleshooting
+
+- **GPU is not visible to Docker.** `docker-compose.yml` uses `runtime: nvidia`. Install the NVIDIA Container Toolkit, restart Docker, and confirm `docker run --rm --runtime=nvidia nvidia/cuda:12.1.1-base-ubuntu22.04 nvidia-smi` lists the device.
+- **`hf download` is rejected.** Run `hf auth login` and retry. The model repository is public; authentication is for Hub rate limits and account access, not a separate model license.
+- **Load fails with a CUDA out-of-memory error.** Lower `ASR_GPU_MEMORY_UTILIZATION` (try `0.6`) and, if startup still fails, lower `ASR_MAX_MODEL_LEN`. Then `POST /control/unload` if a failed worker is still resident, and call `POST /control/load` again.
+- **vLLM reports a shared-memory error.** Compose sets `shm_size: 4gb`. Keep that value or raise it. Do not shrink it.
 
 ## Notes
 
