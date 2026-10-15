@@ -4,13 +4,11 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")" && pwd)"
 cd "${root}"
 
-port="${ASR_API_PORT:-8080}"
-if [[ -f .env ]]; then
-  env_port="$(awk -F= '/^ASR_API_PORT=/{print $2}' .env | tail -n 1)"
-  if [[ -n "${env_port}" ]]; then
-    port="${env_port}"
-  fi
+port="${ASR_API_PORT:-}"
+if [[ -z "${port}" && -f .env ]]; then
+  port="$(awk -F= '/^ASR_API_PORT=/{print $2}' .env | tail -n 1 | tr -d '[:space:]\r"'"'"'')"
 fi
+port="${port:-8080}"
 
 status_url="http://127.0.0.1:${port}/control/status"
 container="asr-api"

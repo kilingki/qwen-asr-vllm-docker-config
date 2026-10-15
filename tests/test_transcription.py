@@ -535,6 +535,56 @@ class TranscriptionApiTest(unittest.TestCase):
         self.assertEqual(body["chunks"][0]["text"], "좋은 문장")
         self.assertNotIn("no", body["chunks"][0]["text"])
 
+    def test_chunk_text_collapses_repeated_phrase_across_segments(self) -> None:
+        phrase = "오늘 날씨가 좋다"
+        response, _, _ = self._post_pcm(
+            160,
+            texts={
+                "chunk-0000.wav": {
+                    "text": phrase,
+                    "language": "ko",
+                    "segments": [
+                        {
+                            "id": index,
+                            "start": float(index),
+                            "end": float(index) + 1.0,
+                            "text": phrase,
+                        }
+                        for index in range(25)
+                    ],
+                }
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["chunks"][0]["text"], phrase)
+
+    def test_chunk_text_keeps_four_repeats(self) -> None:
+        phrase = "오늘 날씨가 좋다"
+        repeated = " ".join([phrase] * 4)
+        response, _, _ = self._post_pcm(
+            160,
+            texts={"chunk-0000.wav": repeated},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["chunks"][0]["text"], repeated)
+
+    def test_chunk_text_keeps_the_same_phrase_in_adjacent_chunks(self) -> None:
+        phrase = "오늘 날씨가 좋다"
+        response, _, _ = self._post_pcm(
+            32000,
+            texts={
+                "chunk-0000.wav": phrase,
+                "chunk-0001.wav": phrase,
+            },
+            chunk_seconds=1,
+            overlap_seconds=0,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            [chunk["text"] for chunk in response.json()["chunks"]],
+            [phrase, phrase],
+        )
+
     def test_unknown_chunk_language_is_null(self) -> None:
         with patch("app.main.DEFAULT_LANGUAGE", ""):
             response, _, _ = self._post_pcm(

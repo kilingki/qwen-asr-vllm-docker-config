@@ -68,6 +68,10 @@ STANDALONE_LANGUAGE_ARTIFACT = re.compile(
 )
 REPEATED_NO_TAIL = re.compile(r"(?:[\s,.;:!?]*(?:no)\b){20,}\s*$", re.IGNORECASE)
 TEXT_TOKEN_RE = re.compile(r"[\uac00-\ud7afA-Za-z0-9]+")
+MAX_REPETITION_NGRAM = 40
+MIN_REPETITION_NGRAM = 1
+MIN_REPETITION_REPEAT = 5
+REPETITION_BOUNDARY_CHARS = " \t\n\r.,;:!?\"'“”‘’()[]{}<>…·"
 
 
 class TranscriptionPipeline:
@@ -127,7 +131,9 @@ class TranscriptionPipeline:
                         "index": chunk.index,
                         "start_sample": chunk.start_sample,
                         "end_sample": chunk.end_sample,
-                        "text": _join_segment_texts(normalized.get("segments") or []),
+                        "text": _collapse_repetition_loops(
+                            _join_segment_texts(normalized.get("segments") or [])
+                        ),
                         "language": normalized.get("language") or language or None,
                     }
                 )
@@ -280,6 +286,116 @@ def _normalize_words(value: Any) -> list[dict[str, Any]]:
             }
         )
     return words
+
+
+def _tokenize_for_repetition(text: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "text": match.group(0),
+            "start": match.start(),
+            "end": match.end(),
+            "normalized": _normalize_repetition_token(match.group(0)),
+        }
+        for match in re.finditer(r"\S+", text)
+    ]
+
+
+def _normalize_repetition_token(token: str) -> str:
+    return token.strip(REPETITION_BOUNDARY_CHARS).lower()
+
+
+def _format_repetition_phrase(tokens: list[dict[str, Any]]) -> str:
+    phrase = " ".join(str(token["text"]) for token in tokens)
+    phrase = re.sub(r"\s+", " ", phrase)
+    return phrase.strip(REPETITION_BOUNDARY_CHARS)
+
+
+def _smallest_repeating_unit_size(phrase_tokens: tuple[str, ...], min_ngram: int = 2) -> int:
+    for unit_size in range(min_ngram, len(phrase_tokens) + 1):
+        if len(phrase_tokens) % unit_size != 0:
+            continue
+        unit = phrase_tokens[:unit_size]
+        if all(
+            phrase_tokens[start : start + unit_size] == unit
+            for start in range(0, len(phrase_tokens), unit_size)
+        ):
+            return unit_size
+    return len(phrase_tokens)
+
+
+def _find_repetition_loops(
+    text: str,
+    min_ngram: int = MIN_REPETITION_NGRAM,
+    max_ngram: int = MAX_REPETITION_NGRAM,
+    min_repeat: int = MIN_REPETITION_REPEAT,
+) -> list[dict[str, Any]]:
+    tokens = _tokenize_for_repetition(text)
+    loops: list[dict[str, Any]] = []
+    index = 0
+
+    while index < len(tokens):
+        detected = None
+        max_size = min(max_ngram, (len(tokens) - index) // min_repeat)
+
+        for ngram_size in range(max_size, min_ngram - 1, -1):
+            phrase_tokens = tuple(token["normalized"] for token in tokens[index : index + ngram_size])
+            if not all(phrase_tokens):
+                continue
+
+            repeat_count = 1
+            while True:
+                next_start = index + repeat_count * ngram_size
+                next_end = next_start + ngram_size
+                if next_end > len(tokens):
+                    break
+                next_tokens = tuple(token["normalized"] for token in tokens[next_start:next_end])
+                if next_tokens != phrase_tokens:
+                    break
+                repeat_count += 1
+
+            if repeat_count >= min_repeat:
+                unit_size = _smallest_repeating_unit_size(phrase_tokens, min_ngram=min_ngram)
+                total_repeat_count = repeat_count * ngram_size // unit_size
+                original_start = tokens[index]["start"]
+                original_end = tokens[index + total_repeat_count * unit_size - 1]["end"]
+                kept_end = tokens[index + unit_size - 1]["end"]
+                detected = {
+                    "start": original_start,
+                    "end": original_end,
+                    "replacement": text[original_start:kept_end],
+                    "phrase": _format_repetition_phrase(tokens[index : index + unit_size]),
+                    "repeat_count": total_repeat_count,
+                    "kept_count": 1,
+                    "ngram_size": unit_size,
+                }
+                break
+
+        if detected:
+            loops.append(detected)
+            index += detected["repeat_count"] * detected["ngram_size"]
+        else:
+            index += 1
+
+    return loops
+
+
+def _collapse_repetition_loops(text: str) -> str:
+    loops = _find_repetition_loops(text)
+    if not loops:
+        return text
+
+    cleaned_parts: list[str] = []
+    previous_end = 0
+    for loop in loops:
+        cleaned_parts.append(text[previous_end : loop["start"]])
+        cleaned_parts.append(str(loop["replacement"]))
+        previous_end = int(loop["end"])
+
+    cleaned_parts.append(text[previous_end:])
+    cleaned = "".join(cleaned_parts)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def _join_segment_texts(segments: list[dict[str, Any]]) -> str:
