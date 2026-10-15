@@ -71,7 +71,9 @@ TEXT_TOKEN_RE = re.compile(r"[\uac00-\ud7afA-Za-z0-9]+")
 MAX_REPETITION_NGRAM = 40
 MIN_REPETITION_NGRAM = 1
 MIN_REPETITION_REPEAT = 5
+MIN_NUMERIC_TEMPLATE_NGRAM = 4
 REPETITION_BOUNDARY_CHARS = " \t\n\r.,;:!?\"'“”‘’()[]{}<>…·"
+REPETITION_NUMERIC_SLOT = re.compile(r"\d{1,3}(?:,\d{3})+|\d+")
 
 
 class TranscriptionPipeline:
@@ -289,19 +291,39 @@ def _normalize_words(value: Any) -> list[dict[str, Any]]:
 
 
 def _tokenize_for_repetition(text: str) -> list[dict[str, Any]]:
-    return [
-        {
-            "text": match.group(0),
-            "start": match.start(),
-            "end": match.end(),
-            "normalized": _normalize_repetition_token(match.group(0)),
-        }
-        for match in re.finditer(r"\S+", text)
-    ]
+    tokens: list[dict[str, Any]] = []
+    for match in re.finditer(r"\S+", text):
+        normalized = _normalize_repetition_token(match.group(0))
+        tokens.append(
+            {
+                "text": match.group(0),
+                "start": match.start(),
+                "end": match.end(),
+                "normalized": normalized,
+                "skeleton": _repetition_skeleton(normalized),
+            }
+        )
+    return tokens
 
 
 def _normalize_repetition_token(token: str) -> str:
     return token.strip(REPETITION_BOUNDARY_CHARS).lower()
+
+
+def _repetition_skeleton(normalized: str) -> str:
+    return REPETITION_NUMERIC_SLOT.sub("#", normalized)
+
+
+def _has_stable_skeleton(skeletons: tuple[str, ...]) -> bool:
+    return any(skeleton.replace("#", "") for skeleton in skeletons)
+
+
+def _is_incomplete_numeric_slot(candidate: str, expected: str) -> bool:
+    return (
+        candidate != expected
+        and candidate.startswith("#")
+        and expected.startswith(candidate)
+    )
 
 
 def _format_repetition_phrase(tokens: list[dict[str, Any]]) -> str:
@@ -323,6 +345,33 @@ def _smallest_repeating_unit_size(phrase_tokens: tuple[str, ...], min_ngram: int
     return len(phrase_tokens)
 
 
+def _incomplete_repeat_end(
+    tokens: list[dict[str, Any]],
+    start: int,
+    unit_skeleton: tuple[str, ...],
+) -> int:
+    position = start
+    matched = 0
+    saw_incomplete_slot = False
+
+    while position < len(tokens) and matched < len(unit_skeleton):
+        candidate = str(tokens[position]["skeleton"])
+        expected = unit_skeleton[matched]
+        if candidate == expected:
+            matched += 1
+            position += 1
+            continue
+        if _is_incomplete_numeric_slot(candidate, expected):
+            saw_incomplete_slot = True
+            position += 1
+            break
+        break
+
+    if saw_incomplete_slot and matched < len(unit_skeleton):
+        return position
+    return start
+
+
 def _find_repetition_loops(
     text: str,
     min_ngram: int = MIN_REPETITION_NGRAM,
@@ -338,41 +387,65 @@ def _find_repetition_loops(
         max_size = min(max_ngram, (len(tokens) - index) // min_repeat)
 
         for ngram_size in range(max_size, min_ngram - 1, -1):
-            phrase_tokens = tuple(token["normalized"] for token in tokens[index : index + ngram_size])
-            if not all(phrase_tokens):
+            window = tokens[index : index + ngram_size]
+            phrase_tokens = tuple(str(token["normalized"]) for token in window)
+            phrase_skeleton = tuple(str(token["skeleton"]) for token in window)
+            if not all(phrase_skeleton):
                 continue
 
             repeat_count = 1
+            exact = True
             while True:
                 next_start = index + repeat_count * ngram_size
                 next_end = next_start + ngram_size
                 if next_end > len(tokens):
                     break
-                next_tokens = tuple(token["normalized"] for token in tokens[next_start:next_end])
-                if next_tokens != phrase_tokens:
+                next_window = tokens[next_start:next_end]
+                next_tokens = tuple(str(token["normalized"]) for token in next_window)
+                next_skeleton = tuple(str(token["skeleton"]) for token in next_window)
+                if next_skeleton != phrase_skeleton:
                     break
+                if next_tokens != phrase_tokens:
+                    exact = False
                 repeat_count += 1
 
-            if repeat_count >= min_repeat:
-                unit_size = _smallest_repeating_unit_size(phrase_tokens, min_ngram=min_ngram)
-                total_repeat_count = repeat_count * ngram_size // unit_size
-                original_start = tokens[index]["start"]
-                original_end = tokens[index + total_repeat_count * unit_size - 1]["end"]
-                kept_end = tokens[index + unit_size - 1]["end"]
-                detected = {
-                    "start": original_start,
-                    "end": original_end,
-                    "replacement": text[original_start:kept_end],
-                    "phrase": _format_repetition_phrase(tokens[index : index + unit_size]),
-                    "repeat_count": total_repeat_count,
-                    "kept_count": 1,
-                    "ngram_size": unit_size,
-                }
-                break
+            if repeat_count < min_repeat:
+                continue
+
+            unit_size = _smallest_repeating_unit_size(phrase_skeleton, min_ngram=min_ngram)
+            unit_skeleton = phrase_skeleton[:unit_size]
+            if not exact and (
+                unit_size < MIN_NUMERIC_TEMPLATE_NGRAM or not _has_stable_skeleton(unit_skeleton)
+            ):
+                continue
+
+            total_repeat_count = repeat_count * ngram_size // unit_size
+            consumed = total_repeat_count * unit_size
+            repeat_end = index + consumed
+            tail_end = _incomplete_repeat_end(tokens, repeat_end, unit_skeleton)
+            if tail_end > repeat_end:
+                original_end = tokens[tail_end - 1]["end"]
+                consumed_tokens = tail_end - index
+            else:
+                original_end = tokens[repeat_end - 1]["end"]
+                consumed_tokens = consumed
+            original_start = tokens[index]["start"]
+            kept_end = tokens[index + unit_size - 1]["end"]
+            detected = {
+                "start": original_start,
+                "end": original_end,
+                "replacement": text[original_start:kept_end],
+                "phrase": _format_repetition_phrase(tokens[index : index + unit_size]),
+                "repeat_count": total_repeat_count,
+                "kept_count": 1,
+                "ngram_size": unit_size,
+                "consumed_tokens": consumed_tokens,
+            }
+            break
 
         if detected:
             loops.append(detected)
-            index += detected["repeat_count"] * detected["ngram_size"]
+            index += int(detected["consumed_tokens"])
         else:
             index += 1
 
@@ -467,6 +540,7 @@ def _clean_asr_text(text: str) -> str:
     cleaned = _strip_repetitive_non_korean_tail(cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned)
     cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    cleaned = _collapse_repetition_loops(cleaned)
     return cleaned.strip()
 
 

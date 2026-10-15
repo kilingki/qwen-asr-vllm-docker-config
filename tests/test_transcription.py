@@ -29,7 +29,7 @@ from fastapi.testclient import TestClient
 from app import main as api
 from app.audio import AudioChunk
 from app.lifecycle import Lifecycle
-from app.pipeline import TranscriptionPipeline
+from app.pipeline import TranscriptionPipeline, _clean_asr_text, _collapse_repetition_loops
 
 
 def write_pcm(
@@ -682,6 +682,56 @@ class TranscriptionApiTest(unittest.TestCase):
             for item in reversed(patches):
                 item.stop()
         return response, used, original
+
+
+def _tanghulu_sentence(year: int, count: str) -> str:
+    return f"{year}년에 {count}곳이 넘는 곳이 문을 열었어요."
+
+
+class RepetitionCollapseTest(unittest.TestCase):
+    def test_exact_phrase_collapses_at_five_and_keeps_four(self) -> None:
+        phrase = "오늘 날씨가 좋다"
+        self.assertEqual(_collapse_repetition_loops(" ".join([phrase] * 5)), phrase)
+        self.assertEqual(
+            _collapse_repetition_loops(" ".join([phrase] * 4)),
+            " ".join([phrase] * 4),
+        )
+
+    def test_numeric_template_collapses_and_drops_broken_tail(self) -> None:
+        sentences = [
+            _tanghulu_sentence(2022, "100"),
+            _tanghulu_sentence(2023, "1,374"),
+            _tanghulu_sentence(2024, "1,500"),
+            _tanghulu_sentence(2025, "1,700"),
+            _tanghulu_sentence(2026, "2,000"),
+            _tanghulu_sentence(2027, "2,500"),
+        ]
+        text = (
+            "앞문장. "
+            + " ".join(sentences)
+            + " 2365년에 171, 이천이십삼년 십월 기준으로"
+        )
+        self.assertEqual(
+            _collapse_repetition_loops(text),
+            f"앞문장. {sentences[0]} 이천이십삼년 십월 기준으로",
+        )
+        self.assertEqual(_clean_asr_text(text), f"앞문장. {sentences[0]} 이천이십삼년 십월 기준으로")
+
+    def test_numeric_template_keeps_four_repeats(self) -> None:
+        text = " ".join(_tanghulu_sentence(2022 + index, str(1500 + index * 200)) for index in range(4))
+        self.assertEqual(_collapse_repetition_loops(text), text)
+
+    def test_short_number_list_is_kept(self) -> None:
+        text = " ".join(f"{amount}원" for amount in (100, 200, 300, 400, 500))
+        self.assertEqual(_collapse_repetition_loops(text), text)
+
+    def test_following_year_sentence_is_kept_without_incomplete_slot(self) -> None:
+        sentences = [_tanghulu_sentence(2022 + index, str(1000 + index * 500)) for index in range(5)]
+        text = " ".join(sentences) + " 2028년에 영업을 시작했다"
+        self.assertEqual(
+            _collapse_repetition_loops(text),
+            f"{sentences[0]} 2028년에 영업을 시작했다",
+        )
 
 
 def _fail_convert(src: Path, dst: Path) -> None:

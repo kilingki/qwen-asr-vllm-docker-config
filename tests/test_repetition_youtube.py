@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Transcribe one known runaway video and check chunk text for FA.
+"""Transcribe known runaway videos and check chunk text for FA.
 
-Downloads https://www.youtube.com/watch?v=Fw-8hZhnH3Q, sends the 16 kHz PCM
-WAV with include_chunks=true, and writes tests/outputs/Fw-8hZhnH3Q/response.json.
-The saved chunks[].text must not still contain a phrase repeated five or more
-times in a row. This talks to a running ASR server. The mock tests in
-test_transcription.py do not.
+Downloads each of Fw-8hZhnH3Q and H2WN130OzLg, sends the 16 kHz PCM WAV with
+include_chunks=true, and writes tests/outputs/<video_id>/response.json.
+The saved chunks[].text must not still contain a phrase, including one whose
+only changes are numbers, repeated five or more times in a row. This talks to
+a running ASR server. The mock tests in test_transcription.py do not.
 """
 from __future__ import annotations
 
@@ -30,8 +30,7 @@ from app.pipeline import _find_repetition_loops
 PCM_SAMPLE_RATE = 16000
 PCM_CHANNELS = 1
 PCM_SAMPLE_WIDTH = 2
-YOUTUBE_URL = "https://www.youtube.com/watch?v=Fw-8hZhnH3Q"
-VIDEO_ID = "Fw-8hZhnH3Q"
+VIDEO_IDS = ("Fw-8hZhnH3Q", "H2WN130OzLg")
 
 
 def project_root() -> Path:
@@ -72,7 +71,14 @@ LANGUAGE = read_env("DEFAULT_LANGUAGE", "ko")
 RETRIES = int(read_env("STT_HEALTH_RETRIES", "30"))
 BACKOFF_SECONDS = float(read_env("STT_HEALTH_BACKOFF_SEC", "2"))
 REQUEST_TIMEOUT_SECONDS = int(read_env("STT_REQUEST_TIMEOUT_SECONDS", "7200"))
-OUTPUT_DIR = project_root() / "tests" / "outputs" / VIDEO_ID
+
+
+def youtube_url(video_id: str) -> str:
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
+def output_dir_for(video_id: str) -> Path:
+    return project_root() / "tests" / "outputs" / video_id
 
 
 def http_json(method: str, url: str) -> tuple[int, dict[str, Any]]:
@@ -337,34 +343,51 @@ def check_saved_response(path: Path) -> int:
     return len(chunks)
 
 
+def transcribe_video(video_id: str) -> None:
+    url = youtube_url(video_id)
+    output_dir = output_dir_for(video_id)
+    print(f"[INFO] youtube_url={url}")
+    print(f"[INFO] output_dir={output_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    source_wav = output_dir / "source.wav"
+    with tempfile.TemporaryDirectory(prefix=f"yt-repetition-{video_id}-") as tmp_dir:
+        downloaded = download_audio(url, Path(tmp_dir))
+        normalize_pcm_wav(downloaded, source_wav)
+
+    payload = request_transcription(source_wav)
+    response_path = output_dir / "response.json"
+    response_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    check_saved_response(response_path)
+    print(f"[SUCCESS] {video_id} chunk text has no 5+ consecutive repeats.")
+
+
 def main() -> int:
+    print(f"[INFO] base_url={BASE_URL}")
+    print(f"[INFO] model={MODEL}")
+    print(f"[INFO] language={LANGUAGE}")
+    print("[INFO] response_format=verbose_json include_chunks=true")
+    print(f"[INFO] video_ids={','.join(VIDEO_IDS)}")
     try:
-        print(f"[INFO] youtube_url={YOUTUBE_URL}")
-        print(f"[INFO] base_url={BASE_URL}")
-        print(f"[INFO] model={MODEL}")
-        print(f"[INFO] language={LANGUAGE}")
-        print("[INFO] response_format=verbose_json include_chunks=true")
-        print(f"[INFO] output_dir={OUTPUT_DIR}")
         wait_for_health()
-
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        source_wav = OUTPUT_DIR / "source.wav"
-        with tempfile.TemporaryDirectory(prefix="yt-repetition-") as tmp_dir:
-            downloaded = download_audio(YOUTUBE_URL, Path(tmp_dir))
-            normalize_pcm_wav(downloaded, source_wav)
-
-        payload = request_transcription(source_wav)
-        response_path = OUTPUT_DIR / "response.json"
-        response_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        check_saved_response(response_path)
-        print("[SUCCESS] Chunk text has no 5+ consecutive repeats.")
-        return 0
     except Exception as exc:  # noqa: BLE001
         print(f"[FAIL] {type(exc).__name__}: {exc}")
         return 1
+
+    failures: list[str] = []
+    for video_id in VIDEO_IDS:
+        try:
+            transcribe_video(video_id)
+        except Exception as exc:  # noqa: BLE001
+            failures.append(video_id)
+            print(f"[FAIL] {video_id} {type(exc).__name__}: {exc}")
+
+    if failures:
+        print(f"[FAIL] videos={','.join(failures)}")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

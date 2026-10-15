@@ -52,7 +52,7 @@ Why this layout:
 - `asr-api/`: FastAPI facade image and app code
 - `tests/test_qwen_asr_youtube.py`: test script that downloads YouTube audio and sends it to the facade API
 - `tests/test_asr_for_fa_input.py`: test script that builds external alignment inputs from a YouTube download
-- `tests/test_repetition_youtube.py`: test script that checks one known runaway video for repeated phrases in `chunks[].text`
+- `tests/test_repetition_youtube.py`: test script that checks `Fw-8hZhnH3Q` and `H2WN130OzLg` separately for repeated phrases in `chunks[].text`
 - `data/`: runtime scratch storage for uploaded and converted audio
 
 ## Requirements
@@ -333,13 +333,13 @@ Generated files:
 
 ### Repeated phrase check
 
-`tests/test_repetition_youtube.py` downloads `https://www.youtube.com/watch?v=Fw-8hZhnH3Q`, normalizes it to 16 kHz mono PCM, and sends it with `response_format=verbose_json` and `include_chunks=true`. The host needs `yt-dlp`, `ffmpeg`, and `curl`. The ASR server must already be up. The script loads the model with `POST /control/load`.
+`tests/test_repetition_youtube.py` downloads `https://www.youtube.com/watch?v=Fw-8hZhnH3Q` and `https://www.youtube.com/watch?v=H2WN130OzLg` separately, normalizes each to 16 kHz mono PCM, and sends each with `response_format=verbose_json` and `include_chunks=true`. The host needs `yt-dlp`, `ffmpeg`, and `curl`. The ASR server must already be up. The script loads the model with `POST /control/load`.
 
 ```bash
 python3 tests/test_repetition_youtube.py
 ```
 
-The response is written to `tests/outputs/Fw-8hZhnH3Q/response.json`, which `.gitignore` ignores. The script reads that file back and fails if `audio` or `chunks` is missing, every `chunks[].text` is empty, or any chunk text still contains a phrase repeated five or more times in a row. Overlap between chunks is not removed. Remove overlap duplicates after FA returns.
+Each response is written to `tests/outputs/<video_id>/response.json`, which `.gitignore` ignores. For each video, the script reads that file back and fails that video if `audio` or `chunks` is missing, every `chunks[].text` is empty, or any chunk text still contains a phrase repeated five or more times in a row. A phrase whose only changes are numbers counts as the same phrase. One video failing does not skip the other. Overlap between chunks is not removed. Remove overlap duplicates after FA returns.
 
 ## External alignment
 
