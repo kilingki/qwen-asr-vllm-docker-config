@@ -26,7 +26,7 @@ from .formatter import (
     to_verbose_json_response,
     to_vtt,
 )
-from .pipeline import TranscriptionPipeline
+from .pipeline import RepetitionRecoveryError, TranscriptionPipeline
 
 app = FastAPI(
     title="Qwen3-ASR OpenAI-Compatible Facade",
@@ -212,6 +212,11 @@ async def create_transcription(
         raise HTTPException(status_code=400, detail="Invalid response_format")
     except HTTPException:
         raise
+    except RepetitionRecoveryError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "asr_repetition_unrecovered", "chunk_index": exc.chunk_index},
+        ) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:

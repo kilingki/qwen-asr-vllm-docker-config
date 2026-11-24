@@ -91,6 +91,35 @@ class FakeAsr:
         return None
 
 
+class RecoveryAsr(FakeAsr):
+    def __init__(
+        self, original_output: str, retry_texts: tuple[str, str], shorter_texts: tuple[str, str] = ("", ""),
+    ) -> None:
+        super().__init__()
+        self.original_output = original_output
+        self.retry_texts = retry_texts
+        self.shorter_texts = shorter_texts
+        self.requests: list[tuple[str, str, int]] = []
+        self.sibling_finished = False
+
+    async def transcribe(self, audio_path: Path, **kwargs) -> dict:
+        del kwargs
+        location = audio_path.parent.name
+        with wave.open(str(audio_path), "rb") as audio:
+            self.requests.append((location, audio_path.name, audio.getnframes()))
+        if audio_path.parent.parent.name == "chunk-0000.retry":
+            index = int(audio_path.stem.rsplit("-", 1)[1])
+            return {"text": self.shorter_texts[index], "language": "ko"}
+        if location == "chunk-0000.retry":
+            index = int(audio_path.stem.rsplit("-", 1)[1])
+            return {"text": self.retry_texts[index], "language": "ko"}
+        if audio_path.name == "chunk-0000.wav":
+            return {"text": self.original_output, "language": "ko"}
+        await asyncio.sleep(0.02)
+        self.sibling_finished = True
+        return {"text": "다음 청크입니다.", "language": "ko"}
+
+
 class OverlapAsr(FakeAsr):
     def __init__(self) -> None:
         super().__init__()
@@ -611,6 +640,66 @@ class TranscriptionApiTest(unittest.TestCase):
         self.assertGreaterEqual(used.max_active, 2)
         self.assertLessEqual(used.max_active, 2)
         self.assertEqual(used.calls, 3)
+
+    def test_character_repetition_retries_only_bad_audio_and_keeps_parent_range(self) -> None:
+        for pattern, repeats in (("字？", 4799), ("甲乙丙丁戊。", 1920)):
+            with self.subTest(period=len(pattern)):
+                asr = RecoveryAsr(
+                    "앞부분. " + pattern * repeats,
+                    ("language Korean <asr_text> 첫 문장. language None<asr_text> 네", "네 다시 설명합니다."),
+                )
+                response, _, _ = self._post_pcm(
+                    64000, asr=asr, chunk_seconds=2, overlap_seconds=0, max_concurrent=1,
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                body = response.json()
+                self.assertEqual(body["audio"]["num_samples"], 64000)
+                self.assertEqual(
+                    [(chunk["start_sample"], chunk["end_sample"], chunk["text"]) for chunk in body["chunks"]],
+                    [(0, 32000, "첫 문장. 네 네 다시 설명합니다."), (32000, 64000, "다음 청크입니다.")],
+                )
+                self.assertIn("네 네", body["text"])
+                self.assertCountEqual(asr.requests, [
+                    ("chunks", "chunk-0000.wav", 32000),
+                    ("chunks", "chunk-0001.wav", 32000),
+                    ("chunk-0000.retry", "chunk-0000.wav", 17600),
+                    ("chunk-0000.retry", "chunk-0001.wav", 17600),
+                ])
+
+    def test_only_the_bad_retry_window_is_split_again(self) -> None:
+        phrase = "甲乙丙丁戊。"
+        asr = RecoveryAsr(
+            phrase * 1920, (phrase, ""),
+            ("앞부분 발화입니다.", "뒤쪽 발화입니다."),
+        )
+        response, _, _ = self._post_pcm(32 * 16000, asr=asr, max_concurrent=1)
+        self.assertEqual(response.status_code, 200, response.text)
+        chunk, = response.json()["chunks"]
+        self.assertEqual(chunk["text"], "앞부분 발화입니다. 뒤쪽 발화입니다.")
+        self.assertEqual((chunk["start_sample"], chunk["end_sample"]), (0, 32 * 16000))
+        self.assertCountEqual([frames for _, _, frames in asr.requests], [
+            32 * 16000, 17 * 16000, 17 * 16000, 149600, 149600,
+        ])
+
+    def test_exhausted_repetition_recovers_neither_repeated_nor_all_empty_output(self) -> None:
+        repetition = "漢？" * 120
+        for retry_texts in ((repetition, "정상"), ("", ""), ("漢。", "")):
+            with self.subTest(retry_text_length=len(retry_texts[0])):
+                asr = RecoveryAsr(repetition, retry_texts)
+                response, _, _ = self._post_pcm(64000, asr=asr, chunk_seconds=2, overlap_seconds=0)
+                self.assertEqual(response.status_code, 500, response.text)
+                self.assertEqual(response.json(), {
+                    "detail": {"code": "asr_repetition_unrecovered", "chunk_index": 0},
+                })
+                self.assertTrue(asr.sibling_finished)
+                self.assertLessEqual(len(asr.requests), 4)
+
+    def test_ordinary_repetition_numbers_and_code_switching_skip_recovery(self) -> None:
+        phrase = "네 네, 12월 25일에 Google 회의와 東京 일정을 확인합니다."
+        response, asr, _ = self._post_pcm(16000, texts={"chunk-0000.wav": phrase})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["text"], phrase)
+        self.assertEqual(asr.calls, 1)
 
     def test_runtime_sources_do_not_reference_fa(self) -> None:
         root = _REPO_ROOT

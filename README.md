@@ -246,6 +246,10 @@ That example is one 120-second chunk, which fits the default `CHUNK_SECONDS`. Lo
 
 Cleanup can drop repeated non-speech tails and other ASR garbage. Inside one chunk, a phrase repeated five or more times in a row is collapsed to a single copy in `chunks[].text` before the response is returned. The same phrase in a neighboring chunk is left alone. That can also remove real speech, so an empty chunk text does not prove the audio was silent.
 
+### Recovery from repeated model output
+
+The facade checks for long character loops in each backend response before applying its existing text cleanup. If it finds a loop, it retries only that audio chunk with shorter overlapping windows of about 30 seconds. If a retry window still loops or contains only the repeated phrase, the facade can split that window once more. Accepted retry text goes through the same cleanup, with remaining Qwen markers removed, and keeps the original chunk index and sample range. Exhausted recovery or empty output for the entire affected range returns HTTP 500 with `detail.code=asr_repetition_unrecovered` and the original `detail.chunk_index`. The runtime logs the chunk index and duration when it starts recovery.
+
 ## Environment Variables
 
 The main settings are documented in `.env.example`.

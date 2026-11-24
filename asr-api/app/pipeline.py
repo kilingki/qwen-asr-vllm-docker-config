@@ -1,16 +1,20 @@
 import asyncio
+import logging
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any
 
 from .asr_client import QwenAsrClient
-from .audio import AudioChunk, PcmWav, create_chunks, create_pcm_chunks, probe_duration
+from .audio import AudioChunk, PcmWav, create_chunks, create_pcm_chunks, create_recovery_chunks, probe_duration
 from .config import (
     CHUNK_OVERLAP_SECONDS,
     CHUNK_SECONDS,
     MAX_CONCURRENT_CHUNKS,
 )
 
+
+logger = logging.getLogger(__name__)
 
 PUNCTUATION = {".", "!", "?", ",", ";", ":", "。", "！", "？", "，", "、"}
 HANGUL_RE = re.compile(r"[\uac00-\ud7af]")
@@ -74,6 +78,21 @@ MIN_REPETITION_REPEAT = 5
 MIN_NUMERIC_TEMPLATE_NGRAM = 4
 REPETITION_BOUNDARY_CHARS = " \t\n\r.,;:!?\"'“”‘’()[]{}<>…·"
 REPETITION_NUMERIC_SLOT = re.compile(r"\d{1,3}(?:,\d{3})+|\d+")
+
+
+RETRY_TRANSCRIPT_MARKER = re.compile(
+    r"(?:\blanguage\s+)?(?:\b[A-Za-z][A-Za-z_-]*\s*)?<\s*asr[\s_-]*text\s*>",
+    re.IGNORECASE,
+)
+MIN_CHARACTER_LOOP_LENGTH = 200
+MAX_CHARACTER_LOOP_PERIOD = 16
+MIN_WINDOW_FOR_FURTHER_SPLIT = 12.0
+
+
+class RepetitionRecoveryError(RuntimeError):
+    def __init__(self, chunk_index: int) -> None:
+        self.chunk_index = chunk_index
+        super().__init__(f"Could not recover repeated output in chunk {chunk_index}")
 
 
 class TranscriptionPipeline:
@@ -183,19 +202,96 @@ class TranscriptionPipeline:
     ) -> list[dict[str, Any]]:
         semaphore = asyncio.Semaphore(max(1, MAX_CONCURRENT_CHUNKS))
 
-        async def transcribe_one(chunk: AudioChunk) -> dict[str, Any]:
+        async def decode(chunk: AudioChunk) -> dict[str, Any]:
             async with semaphore:
-                raw_result = await self.asr_client.transcribe(
+                return await self.asr_client.transcribe(
                     audio_path=chunk.path,
                     model=model,
                     language=language,
                     prompt=prompt,
                     timestamp_granularities=timestamp_granularities,
                 )
-                normalized = self._normalize_backend_result(raw_result, chunk)
-                return _clean_normalized_result(normalized)
 
-        return await asyncio.gather(*(transcribe_one(chunk) for chunk in chunks))
+        async def decode_retry(
+            chunk: AudioChunk, loop: str,
+        ) -> tuple[str, str | None] | None:
+            raw = await decode(chunk)
+            if _find_backend_character_loop(raw) is not None:
+                return None
+            recovered = _clean_normalized_result(self._normalize_backend_result(raw, chunk))
+            # A short retry can emit another model tag after speech.
+            text = " ".join(RETRY_TRANSCRIPT_MARKER.sub(
+                " ", _join_segment_texts(recovered["segments"]),
+            ).split())
+            if _contains_only_loop_text(text, loop):
+                return None
+            return text, recovered["language"]
+
+        async def recover(
+            parent: AudioChunk, loop: str, allow_further_split: bool,
+        ) -> tuple[str, str | None] | None:
+            retry_chunks = await asyncio.to_thread(
+                create_recovery_chunks, parent.path, parent.path.with_suffix(".retry"),
+            )
+            text = ""
+            previous_text = ""
+            previous_end = 0.0
+            recovered_language = language
+            for retry_chunk in retry_chunks:
+                result = await decode_retry(retry_chunk, loop)
+                if result is None and allow_further_split and retry_chunk.duration >= MIN_WINDOW_FOR_FURTHER_SPLIT:
+                    logger.warning(
+                        "Splitting ASR retry window %d of chunk %d (%.2f s) after repeated output",
+                        retry_chunk.index, parent.index, retry_chunk.duration,
+                    )
+                    result = await recover(retry_chunk, loop, allow_further_split=False)
+                if result is None:
+                    return None
+                retry_text, retry_language = result
+                if previous_end <= retry_chunk.start:
+                    previous_text = ""
+                text = _merge_recovery_text(text, previous_text, retry_text)
+                previous_text = retry_text
+                previous_end = retry_chunk.end
+                recovered_language = recovered_language or retry_language
+            if not any(char.isalnum() for char in text) or _find_character_loop(text) is not None:
+                return None
+            return text, recovered_language
+
+        async def transcribe_one(chunk: AudioChunk) -> dict[str, Any]:
+            raw = await decode(chunk)
+            loop = _find_backend_character_loop(raw)
+            if loop is None:
+                return _clean_normalized_result(self._normalize_backend_result(raw, chunk))
+
+            logger.warning(
+                "Retrying ASR chunk %d (%.2f s) after detecting character repetition",
+                chunk.index, chunk.duration,
+            )
+            result = await recover(chunk, loop, allow_further_split=True)
+            if result is None:
+                raise RepetitionRecoveryError(chunk.index)
+            text, recovered_language = result
+            # Recovery keeps the public chunk and coarse segment on the original audio range.
+            return self._normalize_backend_result({"text": text, "language": recovered_language}, chunk)
+
+        # Wait for sibling calls before returning a failure and releasing request scratch files.
+        outcomes = await asyncio.gather(
+            *(transcribe_one(chunk) for chunk in chunks), return_exceptions=True,
+        )
+        results: list[dict[str, Any]] = []
+        quality_error = None
+        for outcome in outcomes:
+            if isinstance(outcome, RepetitionRecoveryError):
+                quality_error = quality_error or outcome
+            elif isinstance(outcome, BaseException):
+                # A transport failure can leave a backend call running. Preserve that failure.
+                raise outcome
+            else:
+                results.append(outcome)
+        if quality_error is not None:
+            raise quality_error
+        return results
 
     def _normalize_backend_result(
         self,
@@ -270,6 +366,52 @@ def _extract_text(payload: dict[str, Any]) -> str:
             return content.strip()
 
     return ""
+
+
+def _find_character_loop(text: str) -> str | None:
+    compact = "".join(unicodedata.normalize("NFC", text).split())
+    if len(compact) < MIN_CHARACTER_LOOP_LENGTH:
+        return None
+    for period in range(1, MAX_CHARACTER_LOOP_PERIOD + 1):
+        matches = 0
+        for end, (before, after) in enumerate(zip(compact, compact[period:]), start=period + 1):
+            matches = matches + 1 if before == after else 0
+            if matches + period >= MIN_CHARACTER_LOOP_LENGTH:
+                return compact[end - period:end]
+    return None
+
+
+def _find_backend_character_loop(payload: dict[str, Any]) -> str | None:
+    text = _extract_text(payload)
+    loop = _find_character_loop(text)
+    if loop is not None:
+        return loop
+    segments = payload.get("segments")
+    if not isinstance(segments, list):
+        return None
+    segment_text = " ".join(str(segment.get("text", "")) for segment in segments if isinstance(segment, dict))
+    return _find_character_loop(segment_text) if segment_text != text else None
+
+
+def _contains_only_loop_text(text: str, loop: str) -> bool:
+    content = "".join(char for char in unicodedata.normalize("NFC", text) if char.isalnum())
+    unit = "".join(char for char in loop if char.isalnum())
+    # The detected unit can start anywhere in the cycle. Ignore punctuation when
+    # checking whether the entire retry output is still the same repeated content.
+    return bool(unit) and len(content) >= len(unit) and content in unit * (len(content) // len(unit) + 2)
+
+
+def _merge_recovery_text(existing: str, previous: str, incoming: str) -> str:
+    if not existing or not incoming:
+        return existing or incoming
+    # Retry audio overlaps by no more than two seconds. Require multiple exact words
+    # before dropping a matching prefix, so isolated repeated words survive.
+    left = previous.split()
+    right = list(re.finditer(r"\S+", incoming))
+    for size in range(min(8, len(left), len(right)), 2, -1):
+        if left[-size:] == [word.group() for word in right[:size]]:
+            return existing + incoming[right[size - 1].end() :]
+    return f"{existing} {incoming}"
 
 
 def _normalize_words(value: Any) -> list[dict[str, Any]]:

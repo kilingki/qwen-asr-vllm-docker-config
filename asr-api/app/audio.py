@@ -1,3 +1,4 @@
+import math
 import shutil
 import subprocess
 import wave
@@ -237,6 +238,25 @@ def create_pcm_chunks(
             break
         start += step
         index += 1
+    return chunks
+
+
+def create_recovery_chunks(source_wav: Path, chunks_dir: Path) -> list[AudioChunk]:
+    pcm = inspect_pcm_wav(source_wav)
+    if pcm.num_samples < 2:
+        return []
+    count = max(2, math.ceil(pcm.num_samples / (30 * pcm.sample_rate)))
+    context = min(pcm.sample_rate, pcm.num_samples // (10 * count))
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    chunks: list[AudioChunk] = []
+    for index in range(count):
+        core_start = index * pcm.num_samples // count
+        core_end = (index + 1) * pcm.num_samples // count
+        start = max(0, core_start - context)
+        end = min(pcm.num_samples, core_end + context)
+        path = chunks_dir / f"chunk-{index:04d}.wav"
+        _write_pcm_slice(source_wav, path, start, end, pcm.sample_rate)
+        chunks.append(AudioChunk(index, path, start / pcm.sample_rate, end / pcm.sample_rate, start, end))
     return chunks
 
 
