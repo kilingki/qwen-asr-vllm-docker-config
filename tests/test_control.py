@@ -24,7 +24,28 @@ install()
 from fastapi.testclient import TestClient
 
 from app import main as api
+from app.config import _get_model_path
 from app.lifecycle import ControlError, Lifecycle, WorkerFailure
+
+
+class CheckpointConfigTests(unittest.TestCase):
+    def test_default_and_legacy_paths(self):
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_get_model_path(), "/models/Qwen3-ASR-1.7B")
+        with unittest.mock.patch.dict(os.environ, {"ASR_MODEL_PATH": "/other/model"}, clear=True):
+            self.assertEqual(_get_model_path(), "/other/model")
+
+    def test_named_checkpoint_overrides_legacy_path(self):
+        settings = {"ASR_CHECKPOINT": "Qwen3-ASR-1.7B-KO-UNIVA", "ASR_MODEL_PATH": "/other/model"}
+        with unittest.mock.patch.dict(os.environ, settings, clear=True):
+            self.assertEqual(_get_model_path(), "/models/Qwen3-ASR-1.7B-KO-UNIVA")
+
+    def test_checkpoint_must_be_a_directory_name(self):
+        for checkpoint in (".", "..", "../model", "/model", "a\\b"):
+            with self.subTest(checkpoint=checkpoint):
+                with unittest.mock.patch.dict(os.environ, {"ASR_CHECKPOINT": checkpoint}, clear=True):
+                    with self.assertRaisesRegex(ValueError, "ASR_CHECKPOINT"):
+                        _get_model_path()
 
 
 class GateWorker:

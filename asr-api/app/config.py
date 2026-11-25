@@ -16,11 +16,20 @@ def _get_float(name: str, default: float) -> float:
     return float(raw)
 
 
+def _get_model_path() -> str:
+    checkpoint = os.getenv("ASR_CHECKPOINT", "")
+    if not checkpoint:
+        return os.getenv("ASR_MODEL_PATH", "/models/Qwen3-ASR-1.7B")
+    if checkpoint in {".", ".."} or "/" in checkpoint or "\\" in checkpoint:
+        raise ValueError("ASR_CHECKPOINT must be a directory name under /models")
+    return f"/models/{checkpoint}"
+
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "info")
 
 ASR_BASE_URL = os.getenv("ASR_BASE_URL", "http://127.0.0.1:18000/v1").rstrip("/")
 ASR_MODEL = os.getenv("ASR_MODEL", "qwen3-asr")
-ASR_MODEL_PATH = os.getenv("ASR_MODEL_PATH", "/models/Qwen3-ASR-1.7B")
+ASR_MODEL_PATH = _get_model_path()
 QWEN_ASR_INTERNAL_HOST = os.getenv("QWEN_ASR_INTERNAL_HOST", "127.0.0.1")
 QWEN_ASR_INTERNAL_PORT = os.getenv("QWEN_ASR_INTERNAL_PORT", "18000")
 ASR_GPU_MEMORY_UTILIZATION = os.getenv("ASR_GPU_MEMORY_UTILIZATION", "0.72")

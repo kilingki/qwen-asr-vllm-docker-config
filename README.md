@@ -78,6 +78,26 @@ If you already downloaded the models to the following paths, no extra download s
 
 - `../models/stt/hf/Qwen3-ASR-1.7B`
 
+### Switch between local checkpoints
+
+Download the Korean fine-tune beside the base checkpoint:
+
+```bash
+hf download TeamUNIVA/qwen3_asr_1.7b_ko \
+  --revision a8b7485274ac50e80a685f3813489fed475adc5f \
+  --local-dir ../models/stt/hf/Qwen3-ASR-1.7B-KO-UNIVA
+```
+
+When the runtime has no active requests, unload the current model. Set
+`ASR_CHECKPOINT=Qwen3-ASR-1.7B-KO-UNIVA` in `.env` and recreate the container
+with `docker compose up --build -d --force-recreate asr-api`. Then call `/control/load`
+to load the selected checkpoint and check `/control/status` for `ready` and
+`resident`. To switch back, set `ASR_CHECKPOINT=Qwen3-ASR-1.7B` and repeat.
+
+`ASR_CHECKPOINT` selects one directory under `MODEL_HOST_DIR`. It takes precedence
+over `ASR_MODEL_PATH`. An empty value uses the existing `ASR_MODEL_PATH` setting.
+Clients continue to request `model=qwen3-asr` with the default `ASR_MODEL` value.
+
 ## Quick Start
 
 1. Copy the example environment file.
@@ -258,6 +278,7 @@ The main settings are documented in `.env.example`.
 - `QWEN_ASR_INTERNAL_HOST`: container-local host for the internal Qwen server
 - `QWEN_ASR_INTERNAL_PORT`: container-local port for the internal Qwen server
 - `MODEL_HOST_DIR`: local directory mounted into the ASR container
+- `ASR_CHECKPOINT`: optional local checkpoint directory name under `MODEL_HOST_DIR`
 - `ASR_MODEL_PATH`: container path to `Qwen3-ASR-1.7B`
 - `ASR_BASE_URL`: internal base URL used by the facade
 - `ASR_MODEL`: served model name exposed by the Qwen server
